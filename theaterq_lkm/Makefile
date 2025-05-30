@@ -6,7 +6,7 @@ PWD := $(shell pwd)
 EXTRA_CFLAGS = -I$(PWD)/include
 obj-m += sch_theaterq.o
 #sch_theaterq-y := sch_theaterq.o
-ccflags-y += -include $(PWD)/include/uapi/linux/pkt_sch_theaterq.h
+ccflags-y += -I$(PWD)/include
 
 .PHONY: clean
 

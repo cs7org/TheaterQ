@@ -21,7 +21,7 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __u32 mode = THEATERQ_STAGE_LOAD;
     struct rtattr *tail;
 
-    for ( ; argc > 2; --argc, ++argv) {
+    for ( ; argc > 0; --argc, ++argv) {
         if (matches(*argv, "mode") == 0) {
             NEXT_ARG();
             if (strcmp(*argv, "LOAD") == 0) {

@@ -1,4 +1,3 @@
-#include <uapi/linux/pkt_sch_theaterq.h>
 #include <linux/module.h>
 #include <net/pkt_sched.h>
 #include <linux/types.h>
@@ -12,6 +11,8 @@
 #include <linux/rtnetlink.h>
 #include <linux/reciprocal_div.h>
 #include <linux/rbtree.h>
+
+#include "include/uapi/linux/pkt_sch_theaterq.h"
 
 MODULE_LICENSE("Proprietary");
 MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
