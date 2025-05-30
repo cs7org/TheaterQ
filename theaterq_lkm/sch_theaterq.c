@@ -20,7 +20,9 @@ MODULE_VERSION("0.1");
 
 // DATA ===================================================================
 
-struct theaterq_sched_data {};
+struct theaterq_sched_data {
+    u32 stage;
+};
 
 // QDISC OPS ==============================================================
 
@@ -35,10 +37,45 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
     return NULL;
 }
 
+static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
+    [TCA_THEATERQ_MODE] = { .type = NLA_U32 },
+};
+
+static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
+                           struct netlink_ext_ack *extack)
+{
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+    struct nlattr *tb[TCA_THEATERQ_MAX + 1];
+    int err;
+
+    err = nla_parse_nested(tb, TCA_THEATERQ_MAX, opt, theaterq_policy, extack);
+    if (err < 0) return err;
+
+    sch_tree_lock(sch);
+
+    if (tb[TCA_THEATERQ_MODE]) {
+        q->stage = nla_get_u32(tb[TCA_THEATERQ_MODE]);
+    }
+
+    sch_tree_unlock(sch);
+    printk(KERN_ERR "Theaterq is now: %d\n", q->stage);
+    return 0;
+}
+
 static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
                          struct netlink_ext_ack *extack)
 {
-    return 1;
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+    int err;
+
+    q->stage = THEATERQ_STAGE_LOAD;
+
+    if (opt) {
+        err = theaterq_change(sch, opt, extack);
+        if (err) return err;
+    }
+
+    return 0;
 }
 
 static void theaterq_reset(struct Qdisc *sch)
@@ -49,12 +86,6 @@ static void theaterq_reset(struct Qdisc *sch)
 static void theaterq_destroy(struct Qdisc *sch)
 {
 
-}
-
-static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
-                           struct netlink_ext_ack *extack)
-{
-    return 1;
 }
 
 static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
