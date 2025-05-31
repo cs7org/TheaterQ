@@ -11,7 +11,10 @@
 #include <linux/rtnetlink.h>
 #include <linux/reciprocal_div.h>
 #include <linux/rbtree.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,10)
 #include <net/gso.h>
+#endif
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 #include <net/sock.h>
