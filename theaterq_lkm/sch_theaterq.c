@@ -207,7 +207,7 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
             struct sk_buff *t_skb = skb_rb_last(&q->t_root);
             struct theaterq_skb_cb *t_last = theaterq_skb_cb(t_skb);
 
-            if (!last || t_last->time_to_send < last->time_to_send) {
+            if (!last || t_last->time_to_send > last->time_to_send) {
                 last = t_last;
             }
         }
