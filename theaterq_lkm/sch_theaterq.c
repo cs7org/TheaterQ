@@ -18,6 +18,8 @@
 #include <net/netlink.h>
 #include <net/pkt_sched.h>
 #include <net/sock.h>
+#include <linux/atomic.h>
+#include <linux/cdev.h>
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
@@ -26,7 +28,7 @@ MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
 MODULE_DESCRIPTION("Trace File based Link Emulator");
 MODULE_VERSION("0.1");
 
-// DATA + HELPER FUNCTIONS ================================================
+// DATA + HELPER FUNCTIONS ================================================ 
 
 struct theaterq_entry {
     s64 latency;
@@ -34,6 +36,11 @@ struct theaterq_entry {
     u64 rate;
     u32 loss;
     u32 limit;
+};
+
+enum {
+    THEATERQ_CDEV_AVAILABLE,
+    THEATERQ_CDEV_OPENED,
 };
 
 struct theaterq_sched_data {
@@ -51,16 +58,21 @@ struct theaterq_sched_data {
         struct rnd_state prng_state;
     } prng;
 
-    struct tc_netem_slot slot_config;
-    struct slotstate {
-        u64 slot_next;
-        s32 packets_left;
-        s32 bytes_left;
-    } slot;
+    char *magic;
 
     s32 packet_overhead;
     u32 stage;
     struct theaterq_entry *current_entry;
+
+    struct ingest_cdev {
+        char name[64];
+        bool en;
+        struct class *cls;
+        struct device *device;
+        dev_t dev; // TODO One global dev, bitlist for majors.
+        struct cdev cdev;
+        atomic_t opened;
+    } ingest_cdev; 
 };
 
 struct theaterq_skb_cb {
@@ -75,6 +87,8 @@ static inline struct theaterq_skb_cb *theaterq_skb_cb(struct sk_buff *skb)
 
 static inline bool loss_event(struct theaterq_sched_data *q)
 {
+    if (!q->current_entry) return false;
+
     return q->current_entry->loss && 
            q->current_entry->loss >= prandom_u32_state(&q->prng.prng_state);
 }
@@ -90,6 +104,8 @@ static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng) {
 
 static u64 packet_time_ns(u64 len, const struct theaterq_sched_data *q)
 {
+    if (!q->current_entry) return 0ul;
+
     len += q->packet_overhead;
     return div64_u64(len * NSEC_PER_SEC, q->current_entry->rate);
 }
@@ -166,6 +182,125 @@ static struct sk_buff *theaterq_segment(struct sk_buff *skb, struct Qdisc *sch,
     return segs;
 }
 
+// CHARDEV OPS ============================================================
+
+static int ingest_cdev_open(struct inode *inode, struct file *filp)
+{
+    struct theaterq_sched_data *q;
+    q = container_of(inode->i_cdev, struct theaterq_sched_data, 
+                     ingest_cdev.cdev);
+    filp->private_data = q;
+
+    if (atomic_cmpxchg(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE, 
+                       THEATERQ_CDEV_OPENED))
+        return -EBUSY;
+
+    try_module_get(THIS_MODULE);
+    return 0;
+}
+
+static int ingest_cdev_release(struct inode *inode, struct file *filp)
+{
+    struct theaterq_sched_data *q = filp->private_data;
+    atomic_set(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE);
+
+    module_put(THIS_MODULE);
+    return 0;
+}
+
+static ssize_t ingest_cdev_read(struct file *filp, char __user *buffer,
+                                size_t length, loff_t *offset)
+{
+    return -EINVAL;
+}
+
+static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
+                             size_t length, loff_t *offset)
+{
+    struct theaterq_sched_data *q = filp->private_data;
+    printk(KERN_INFO "ingest_cdev: %s\n", q->magic);
+    return 1;
+}
+
+static struct file_operations theaterq_cdev_fops = {
+    .write   = ingest_cdev_write,
+    .read    = ingest_cdev_read,
+    .open    = ingest_cdev_open,
+    .release = ingest_cdev_release,
+};
+
+static int create_ingest_cdev(struct Qdisc *sch)
+{
+    int ret;
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+
+    ret = snprintf(q->ingest_cdev.name, sizeof(q->ingest_cdev.name), 
+            "theaterq:%s:%x:%x", 
+            qdisc_dev(sch)->name, 
+            TC_H_MAJ(sch->handle) >> 16, 
+            TC_H_MIN(sch->handle));
+
+    if (ret < 0) 
+        return -ENOBUFS;
+
+    ret = alloc_chrdev_region(&q->ingest_cdev.dev, 0, 1, q->ingest_cdev.name);
+    if (ret < 0)
+        return ret;
+
+    cdev_init(&q->ingest_cdev.cdev, &theaterq_cdev_fops);
+    q->ingest_cdev.cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&q->ingest_cdev.cdev, q->ingest_cdev.dev, 1);
+    if (ret < 0)
+        goto err_unregister;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,4,0)
+    q->ingest_cdev.cls = class_create(q->ingest_cdev.name);
+#else
+    q->ingest_cdev.cls = class_create(THIS_MODULE, q->ingest_cdev.name);
+#endif
+
+    if (IS_ERR(q->ingest_cdev.cls)) {
+        ret = PTR_ERR(q->ingest_cdev.cls);
+        goto err_cdev_delete;
+    }
+
+    q->ingest_cdev.device = device_create(q->ingest_cdev.cls, NULL, 
+                                          q->ingest_cdev.dev, NULL, 
+                                          q->ingest_cdev.name);
+
+    if (IS_ERR(q->ingest_cdev.device)) {
+        ret = PTR_ERR(q->ingest_cdev.device);
+        goto err_cls_delete;
+    }
+
+    atomic_set(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE);
+    q->ingest_cdev.en = true;
+    return 0;
+
+err_cls_delete:
+    class_destroy(q->ingest_cdev.cls);
+err_cdev_delete:
+    cdev_del(&q->ingest_cdev.cdev);
+err_unregister:
+    unregister_chrdev_region(q->ingest_cdev.dev, 1);
+    return ret;
+}
+
+static int destroy_ingest_cdev(struct Qdisc *sch)
+{
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+
+    if (!q->ingest_cdev.en)
+        return 0;
+    
+    class_destroy(q->ingest_cdev.cls);
+    cdev_del(&q->ingest_cdev.cdev);
+    unregister_chrdev_region(q->ingest_cdev.dev, 1);
+    q->ingest_cdev.en = false;
+    return 0;
+}
+
 // QDISC OPS ==============================================================
 
 static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
@@ -174,9 +309,12 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct theaterq_skb_cb *cb;
     s64 now = ktime_get_ns();
-    s64 delay = get_pkt_delay(q->current_entry->latency, 
+    s64 delay = 0;
+    if (q->current_entry) {
+        delay = get_pkt_delay(q->current_entry->latency, 
                               q->current_entry->jitter,
                               &q->prng);
+    }
     skb->prev = NULL;
 
     if (loss_event(q)) {
@@ -185,13 +323,14 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
-    if (q->current_entry->latency ||
-        q->current_entry->jitter ||
-        q->current_entry->rate) {
+    if (q->current_entry  && 
+        (q->current_entry->latency ||
+         q->current_entry->jitter ||
+         q->current_entry->rate)) {
             skb_orphan_partial(skb);
     }
 
-    if (unlikely(q->t_len >= q->current_entry->limit)) {
+    if (unlikely(q->current_entry && q->t_len >= q->current_entry->limit)) {
         qdisc_drop_all(skb, sch, to_free);
         return NET_XMIT_DROP;
     }
@@ -199,7 +338,7 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
 
-    if (q->current_entry->rate) {
+    if (q->current_entry && q->current_entry->rate) {
         struct theaterq_skb_cb *last = NULL;
 
         if (sch->q.tail) {
@@ -338,6 +477,8 @@ deliver:
 
 static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_MODE] = { .type = NLA_U32 },
+    [TCA_THEATERQ_PRNG_SEED] = { .type = NLA_U64 },
+    [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -364,12 +505,19 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
                          struct netlink_ext_ack *extack)
 {
+    int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
     q->stage = THEATERQ_STAGE_LOAD;
     qdisc_watchdog_init(&q->watchdog, sch);
 
     if (!opt) return -EINVAL;
+
+    q->ingest_cdev.en = false;
+    ret = create_ingest_cdev(sch);
+    if (ret < 0) return ret;
+
+    q->magic = "MAGIC";
     
     return theaterq_change(sch, opt, extack);
 }
@@ -389,6 +537,7 @@ static void theaterq_destroy(struct Qdisc *sch)
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
     qdisc_watchdog_cancel(&q->watchdog);
+    destroy_ingest_cdev(sch);
     if (q->qdisc) qdisc_put(q->qdisc);
 }
 
