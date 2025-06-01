@@ -28,14 +28,29 @@ MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
 MODULE_DESCRIPTION("Trace File based Link Emulator");
 MODULE_VERSION("0.1");
 
-// DATA + HELPER FUNCTIONS ================================================ 
+// DATA + HELPER FUNCTIONS ================================================
+
+#define THEATERQ_INGEST_MAXLEN 256
+
+static struct kmem_cache *theaterq_cache = NULL;
 
 struct theaterq_entry {
-    s64 latency;
-    s64 jitter;
+    u64 delay;
+    u64 latency;
+    u64 jitter;
     u64 rate;
     u32 loss;
     u32 limit;
+    struct theaterq_entry *next;
+};
+
+static const struct theaterq_entry theaterq_default_entry = {
+    .latency = 0ULL,
+    .jitter = 0ULL,
+    .rate = 0ULL,
+    .loss = 0UL,
+    .limit = 1000UL,
+    .next = NULL,
 };
 
 enum {
@@ -58,21 +73,31 @@ struct theaterq_sched_data {
         struct rnd_state prng_state;
     } prng;
 
-    char *magic;
-
     s32 packet_overhead;
     u32 stage;
+    u32 cont_mode;
     struct theaterq_entry *current_entry;
+    struct theaterq_entry *e_head;
+    struct theaterq_entry *e_tail;
+    u64 e_entries;
 
     struct ingest_cdev {
         char name[64];
         bool en;
         struct class *cls;
         struct device *device;
-        dev_t dev; // TODO One global dev, bitlist for majors.
+        dev_t dev;
         struct cdev cdev;
         atomic_t opened;
     } ingest_cdev; 
+
+    struct ingest_helper {
+        char lbuf[THEATERQ_INGEST_MAXLEN];
+        size_t lpos;
+    } ingest_helper;
+
+    struct hrtimer timer;
+    u32 t_running;
 };
 
 struct theaterq_skb_cb {
@@ -166,7 +191,7 @@ static void tfifo_reset(struct Qdisc *sch)
     q->t_len = 0;
 }
 
-static struct sk_buff *theaterq_segment(struct sk_buff *skb, struct Qdisc *sch,
+static __attribute__((unused)) struct sk_buff *theaterq_segment(struct sk_buff *skb, struct Qdisc *sch,
                                         struct sk_buff **to_free)
 {
     struct sk_buff *segs;
@@ -180,6 +205,23 @@ static struct sk_buff *theaterq_segment(struct sk_buff *skb, struct Qdisc *sch,
 
     consume_skb(skb);
     return segs;
+}
+
+static void entry_list_clear(struct theaterq_sched_data *q)
+{
+    struct theaterq_entry *e = q->e_head;
+    struct theaterq_entry *next = NULL;
+
+    while (e) {
+        next = e->next;
+        kmem_cache_free(theaterq_cache, e);
+        e = next;
+    }
+
+    q->e_head = NULL;
+    q->e_tail = NULL;
+    q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
+    q->e_entries = 0;
 }
 
 // CHARDEV OPS ============================================================
@@ -215,11 +257,130 @@ static ssize_t ingest_cdev_read(struct file *filp, char __user *buffer,
 }
 
 static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
-                             size_t length, loff_t *offset)
+                             size_t len, loff_t *offset)
 {
     struct theaterq_sched_data *q = filp->private_data;
-    printk(KERN_INFO "ingest_cdev: %s\n", q->magic);
-    return 1;
+    
+    char kbuf[THEATERQ_INGEST_MAXLEN];
+    size_t actual_read = 0;
+
+    if (len == 0)
+        return -EINVAL;
+    
+    while (len > 0) {
+        size_t to_copy = min(len, sizeof(kbuf));
+        if (copy_from_user(kbuf, buffer, to_copy))
+            return -EFAULT;
+
+        for (int i = 0; i < to_copy; i++) {
+            char c = kbuf[i];
+
+            if (q->ingest_helper.lpos >= THEATERQ_INGEST_MAXLEN - 1) {
+                q->ingest_helper.lpos = 0;
+                return -EINVAL;
+            }
+
+            q->ingest_helper.lbuf[q->ingest_helper.lpos++] = c;
+
+            if (c == '\n') {
+                if (q->ingest_helper.lpos == 1) continue;
+
+                q->ingest_helper.lbuf[q->ingest_helper.lpos - 1] = '\0';
+
+                u64 delay;
+                u64 latency;
+                u64 jitter;
+                u64 rate;
+                u32 loss;
+                u32 limit;
+                struct theaterq_entry *entry;
+
+                /* Input format:
+                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT\n
+                 *  ns     ns      ns   Bps   a)    b)
+                 * 
+                 * a) Scaled u32: 0 = 0%, U32_MAX = 100%, kernel does not 
+                 *  support floating point numbers
+                 * b) Just a number
+                 */
+
+                char *token;
+                char *p = q->ingest_helper.lbuf;
+                int i = 0;
+
+#define PARSE_TOKEN(fun, dest) do { \
+                        token = strsep(&p, ","); \
+                        if (!token || fun(token, 10, dest)) { \
+                            printk(KERN_WARNING \
+                                  "sch_theaterq: Parsing error at pos %u\n", i); \
+                            q->ingest_helper.lpos = 0; \
+                            return -EINVAL; \
+                        } \
+                        i++; \
+                    } while (0)
+
+                PARSE_TOKEN(kstrtou64, &delay);
+                PARSE_TOKEN(kstrtou64, &latency);
+                PARSE_TOKEN(kstrtou64, &jitter);
+                PARSE_TOKEN(kstrtou64, &rate);
+                PARSE_TOKEN(kstrtou32, &loss);
+                PARSE_TOKEN(kstrtou32, &limit);
+
+#undef PARSE_TOKEN
+
+                if (p && *p != '\0') {
+                    return -EINVAL;
+                }
+
+                q->ingest_helper.lpos = 0;
+
+                if (q->e_head == NULL && delay != 0) {
+                    printk(KERN_WARNING 
+                           "sch_theaterq: First loaded entry needs a delay of 0\n");
+                    return -EINVAL;
+                }
+
+                if (q->stage != THEATERQ_STAGE_LOAD) {
+                    printk(KERN_WARNING 
+                           "sch_theaterq: Qdisc not in load stage\n");
+                    return -EBUSY;
+                }
+
+                entry = kmem_cache_alloc(theaterq_cache, GFP_KERNEL);
+                if (!entry) {
+                    printk(KERN_ERR 
+                           "sch_theaterq: Unable to alloc memory for entry\n");
+                    return -ENOMEM;
+                }
+
+                entry->delay = delay; 
+                entry->latency = latency;
+                entry->jitter = jitter;
+                entry->rate = rate / 8; // bits per second -> byte per second
+                entry->loss = loss;
+                entry->limit = limit;
+                entry->next = NULL;
+
+                if (q->e_head == NULL) {
+                    q->e_head = entry;
+                    q->e_tail = entry;
+                } else {
+                    q->e_tail->next = entry;
+                    q->e_tail = entry;
+                }
+
+                q->e_entries++;
+            }
+        }
+
+        buffer += to_copy;
+        len -= to_copy;
+        actual_read += to_copy;
+    }
+
+    printk(KERN_ERR "Entries: %llu\n", q->e_entries);
+    
+    return actual_read;
 }
 
 static struct file_operations theaterq_cdev_fops = {
@@ -303,16 +464,64 @@ static int destroy_ingest_cdev(struct Qdisc *sch)
 
 // QDISC OPS ==============================================================
 
+static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
+{
+    struct theaterq_sched_data *q = container_of(timer, 
+                                        struct theaterq_sched_data, timer);
+    u64 next_delay;
+
+    if (!q->t_running)
+        return HRTIMER_NORESTART;
+
+    if (!q->current_entry->next) {
+        switch (q->cont_mode) {
+            case THEATERQ_CONT_LOOP:
+                WRITE_ONCE(q->current_entry, q->e_head);
+                break;
+
+            case THEATERQ_CONT_CLEAR:
+                WRITE_ONCE(q->current_entry, (struct theaterq_entry *) &theaterq_default_entry);
+
+                // No fallthrough, gcc does not allow it after WRITE_ONCE
+                WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
+                q->t_running = 0;
+                return HRTIMER_NORESTART;
+
+            case THEATERQ_CONT_HOLD:
+                /* fallthrough */
+            default:
+                WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
+                q->t_running = 0;
+                return HRTIMER_NORESTART;
+        }
+    } else {
+        WRITE_ONCE(q->current_entry, q->current_entry->next);
+    }
+
+    printk(KERN_INFO "Enabled entry: %llu\n", q->current_entry->latency);
+
+    if (q->current_entry->next) {
+        next_delay = q->current_entry->next->delay;
+    } else {
+        next_delay = q->current_entry->delay;
+    }
+
+    hrtimer_forward_now(timer, ns_to_ktime(next_delay));
+    return HRTIMER_RESTART;
+}
+
 static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
                             struct sk_buff **to_free)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct theaterq_skb_cb *cb;
+
+    struct theaterq_entry *current_entry = READ_ONCE(q->current_entry);
     s64 now = ktime_get_ns();
     s64 delay = 0;
-    if (q->current_entry) {
-        delay = get_pkt_delay(q->current_entry->latency, 
-                              q->current_entry->jitter,
+    if (current_entry) {
+        delay = get_pkt_delay(current_entry->latency, 
+                              current_entry->jitter,
                               &q->prng);
     }
     skb->prev = NULL;
@@ -323,14 +532,14 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
-    if (q->current_entry  && 
-        (q->current_entry->latency ||
-         q->current_entry->jitter ||
-         q->current_entry->rate)) {
+    if (current_entry  && 
+        (current_entry->latency ||
+         current_entry->jitter ||
+         current_entry->rate)) {
             skb_orphan_partial(skb);
     }
 
-    if (unlikely(q->current_entry && q->t_len >= q->current_entry->limit)) {
+    if (unlikely(current && q->t_len >= current_entry->limit)) {
         qdisc_drop_all(skb, sch, to_free);
         return NET_XMIT_DROP;
     }
@@ -338,7 +547,7 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
 
-    if (q->current_entry && q->current_entry->rate) {
+    if (current_entry && current_entry->rate) {
         struct theaterq_skb_cb *last = NULL;
 
         if (sch->q.tail) {
@@ -479,27 +688,90 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_MODE] = { .type = NLA_U32 },
     [TCA_THEATERQ_PRNG_SEED] = { .type = NLA_U64 },
     [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
+    [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
 };
+
+static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
+{
+    if (q->t_running)
+        return 0;
+
+    if (!q->e_head)
+        return EINVAL;
+
+    q->current_entry = q->e_head;
+
+    if (!q->current_entry->next)
+        return -EINVAL;
+    
+    ktime_t delay = ns_to_ktime(q->current_entry->next->delay);
+    q->t_running = 1;
+    hrtimer_start(&q->timer, delay, HRTIMER_MODE_REL);
+    return 0;
+}
+
+static void theaterq_stop_hrtimer(struct theaterq_sched_data *q)
+{
+    if (!q->t_running)
+        return;
+
+    q->t_running = 0;
+    hrtimer_cancel(&q->timer);
+}
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
                            struct netlink_ext_ack *extack)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct nlattr *tb[TCA_THEATERQ_MAX + 1];
-    int err;
+    int run_hrtimer = 0;
+    int ret;
 
-    err = nla_parse_nested(tb, TCA_THEATERQ_MAX, opt, theaterq_policy, extack);
-    if (err < 0) return err;
+    ret = nla_parse_nested(tb, TCA_THEATERQ_MAX, opt, theaterq_policy, extack);
+    if (ret < 0) return ret;
 
     sch_tree_lock(sch);
-
     if (tb[TCA_THEATERQ_MODE]) {
-        q->stage = nla_get_u32(tb[TCA_THEATERQ_MODE]);
+        u32 new_stage = nla_get_u32(tb[TCA_THEATERQ_MODE]);
+
+        if (new_stage == THEATERQ_STAGE_FINISH)
+            new_stage = THEATERQ_STAGE_LOAD;
+
+        if (new_stage == THEATERQ_STAGE_CLEAR) {
+            theaterq_stop_hrtimer(q);
+            entry_list_clear(q);
+            new_stage = THEATERQ_STAGE_LOAD;
+        } else if (new_stage == THEATERQ_STAGE_LOAD && 
+                   q->stage != new_stage) {
+            theaterq_stop_hrtimer(q);
+            entry_list_clear(q);
+        } else if (new_stage == THEATERQ_STAGE_RUN) {
+            if (!q->e_entries) {
+                ret = -ENODATA;
+                printk(KERN_WARNING "theaterq: Unable to run without entries!");
+                goto err_out;
+            }
+
+            run_hrtimer = 1;
+        }
+
+        q->stage = new_stage;
     }
 
-    sch_tree_unlock(sch);
+    if (tb[TCA_THEATERQ_CONT_MODE]) {
+        q->cont_mode = nla_get_u32(tb[TCA_THEATERQ_CONT_MODE]);
+    }
+
     printk(KERN_ERR "Theaterq is now: %d\n", q->stage);
-    return 0;
+
+    sch_tree_unlock(sch);
+    if (run_hrtimer)
+        ret = theaterq_run_hrtimer(q);
+    return ret;
+
+err_out:
+    sch_tree_unlock(sch);
+    return ret;
 }
 
 static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
@@ -517,8 +789,10 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     ret = create_ingest_cdev(sch);
     if (ret < 0) return ret;
 
-    q->magic = "MAGIC";
-    
+    entry_list_clear(q);
+
+    hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    q->timer.function = theaterq_timer_cb;
     return theaterq_change(sch, opt, extack);
 }
 
@@ -536,8 +810,10 @@ static void theaterq_destroy(struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
+    theaterq_stop_hrtimer(q);
     qdisc_watchdog_cancel(&q->watchdog);
     destroy_ingest_cdev(sch);
+    entry_list_clear(q);
     if (q->qdisc) qdisc_put(q->qdisc);
 }
 
@@ -619,11 +895,23 @@ static struct Qdisc_ops theaterq_qdisc_ops __read_mostly = {
 
 static int __init sch_theaterq_init(void)
 {
+    theaterq_cache = kmem_cache_create("theaterq_cache",
+                                       sizeof(struct theaterq_entry),
+                                       0, SLAB_HWCACHE_ALIGN, NULL);
+    
+    if (!theaterq_cache) {
+        printk(KERN_ERR "theaterq: Unable to create slab allocator");
+        return -ENOMEM;
+    }
+
     return register_qdisc(&theaterq_qdisc_ops);
 }
 
 static void __exit sch_theaterq_exit(void)
 {
+    if (theaterq_cache)
+        kmem_cache_destroy(theaterq_cache);
+
     unregister_qdisc(&theaterq_qdisc_ops);
 }
 

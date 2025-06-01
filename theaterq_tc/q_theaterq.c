@@ -12,13 +12,14 @@
 
 static void explain(void)
 {
-    fprintf(stderr, "Usage: ... theaterq mode [LOAD|RUN]\n");
+    fprintf(stderr, "Usage: ... theaterq mode [LOAD|RUN|CLEAR] cont [LOOP|HOLD|CLEAR]\n");
 }
 
 static int theaterq_parse_opt(const struct qdisc_util *qu, int argc, 
                               char **argv, struct nlmsghdr *n, const char *dev)
 {
     __u32 mode = THEATERQ_STAGE_LOAD;
+    __u32 cont = THEATERQ_CONT_HOLD;
     struct rtattr *tail;
 
     for ( ; argc > 0; --argc, ++argv) {
@@ -28,8 +29,23 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 mode = THEATERQ_STAGE_LOAD;
             } else if (strcmp(*argv, "RUN") == 0) {
                 mode = THEATERQ_STAGE_RUN;
+            } else if (strcmp(*argv, "CLEAR") == 0) {
+                mode = THEATERQ_STAGE_CLEAR;
             } else {
                 fprintf(stderr, "Unsupported mode \"%s\".\n", *argv);
+                explain();
+                return -1;
+            }
+        } else if (matches(*argv, "cont") == 0) {
+            NEXT_ARG();
+            if (strcmp(*argv, "LOOP") == 0) {
+                mode = THEATERQ_CONT_LOOP;
+            } else if (strcmp(*argv, "HOLD") == 0) {
+                mode = THEATERQ_CONT_HOLD;
+            } else if (strcmp(*argv, "CLEAR") == 0) {
+                mode = THEATERQ_CONT_CLEAR;
+            } else {
+                fprintf(stderr, "Unsupported continue mode \"%s\".\n", *argv);
                 explain();
                 return -1;
             }
@@ -45,8 +61,9 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
 
     tail = addattr_nest(n, 1024, TCA_OPTIONS | NLA_F_NESTED);
     addattr_l(n, 1024, TCA_THEATERQ_MODE, &mode, sizeof(mode));
+    addattr_l(n, 1024, TCA_THEATERQ_CONT_MODE, &cont, sizeof(cont));
     addattr_nest_end(n, tail);
-
+    fprintf(stderr, "Please ingest Trace File using /dev/theaterq:eth1:10:0.\n");
     return 0;
 }
 
