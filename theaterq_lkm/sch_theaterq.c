@@ -121,7 +121,8 @@ static inline bool loss_event(struct theaterq_sched_data *q)
 static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng) {
     u32 rnd;
 
-    if (sigma == 0) return mu;
+    if (sigma == 0)
+        return mu;
 
     rnd = prandom_u32_state(&prng->prng_state);
     return ((rnd % (2 * (u32) sigma)) + mu) - sigma;
@@ -129,7 +130,8 @@ static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng) {
 
 static u64 packet_time_ns(u64 len, const struct theaterq_sched_data *q)
 {
-    if (!q->current_entry) return 0ul;
+    if (!q->current_entry)
+        return 0ul;
 
     len += q->packet_overhead;
     return div64_u64(len * NSEC_PER_SEC, q->current_entry->rate);
@@ -141,11 +143,10 @@ static void tfifo_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
     u64 tnext = theaterq_skb_cb(nskb)->time_to_send;
 
     if (!q->t_tail || tnext >= theaterq_skb_cb(q->t_tail)->time_to_send) {
-        if (q->t_tail) {
+        if (q->t_tail)
             q->t_tail->next = nskb;
-        } else {
+        else
             q->t_head = nskb;
-        }
         
         q->t_tail = nskb;
     } else {
@@ -157,11 +158,10 @@ static void tfifo_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
 
             parent = *p;
             skb = rb_to_skb(parent);
-            if (tnext >= theaterq_skb_cb(skb)->time_to_send) {
+            if (tnext >= theaterq_skb_cb(skb)->time_to_send)
                 p = &parent->rb_right;
-            } else {
+            else
                 p = &parent->rb_left;
-            }
         }
 
         rb_link_node(&nskb->rbnode, parent, p);
@@ -500,11 +500,10 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
 
     printk(KERN_INFO "Enabled entry: %llu\n", q->current_entry->latency);
 
-    if (q->current_entry->next) {
+    if (q->current_entry->next)
         next_delay = q->current_entry->next->delay;
-    } else {
+    else
         next_delay = q->current_entry->delay;
-    }
 
     hrtimer_forward_now(timer, ns_to_ktime(next_delay));
     return HRTIMER_RESTART;
@@ -558,17 +557,15 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
             struct sk_buff *t_skb = skb_rb_last(&q->t_root);
             struct theaterq_skb_cb *t_last = theaterq_skb_cb(t_skb);
 
-            if (!last || t_last->time_to_send > last->time_to_send) {
+            if (!last || t_last->time_to_send > last->time_to_send)
                 last = t_last;
-            }
         }
 
         if (q->t_tail) {
             struct theaterq_skb_cb *t_last = theaterq_skb_cb(q->t_tail);
 
-            if (!last || t_last->time_to_send > last->time_to_send) {
+            if (!last || t_last->time_to_send > last->time_to_send)
                 last = t_last;
-            }
         }
 
         if (last) {
@@ -596,11 +593,10 @@ static struct sk_buff *theaterq_peek(struct theaterq_sched_data *q)
     t1 = theaterq_skb_cb(skb)->time_to_send;
     t2 = theaterq_skb_cb(q->t_head)->time_to_send;
 
-    if (t1 < t2) {
+    if (t1 < t2)
         return skb;
-    } else {
+    else
         return q->t_head;
-    }
 }
 
 static void theaterq_erase_head(struct theaterq_sched_data *q, 
@@ -685,7 +681,7 @@ deliver:
 }
 
 static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
-    [TCA_THEATERQ_MODE] = { .type = NLA_U32 },
+    [TCA_THEATERQ_STAGE] = { .type = NLA_U32 },
     [TCA_THEATERQ_PRNG_SEED] = { .type = NLA_U64 },
     [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
     [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
@@ -731,8 +727,8 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     if (ret < 0) return ret;
 
     sch_tree_lock(sch);
-    if (tb[TCA_THEATERQ_MODE]) {
-        u32 new_stage = nla_get_u32(tb[TCA_THEATERQ_MODE]);
+    if (tb[TCA_THEATERQ_STAGE]) {
+        u32 new_stage = nla_get_u32(tb[TCA_THEATERQ_STAGE]);
 
         if (new_stage == THEATERQ_STAGE_FINISH)
             new_stage = THEATERQ_STAGE_LOAD;
@@ -748,7 +744,8 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         } else if (new_stage == THEATERQ_STAGE_RUN) {
             if (!q->e_entries) {
                 ret = -ENODATA;
-                printk(KERN_WARNING "theaterq: Unable to run without entries!");
+                printk(KERN_WARNING 
+                       "theaterq: Unable to run without entries!\n");
                 goto err_out;
             }
 
@@ -758,9 +755,17 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         q->stage = new_stage;
     }
 
-    if (tb[TCA_THEATERQ_CONT_MODE]) {
+    if (tb[TCA_THEATERQ_CONT_MODE])
         q->cont_mode = nla_get_u32(tb[TCA_THEATERQ_CONT_MODE]);
-    }
+
+    if (tb[TCA_THEATERQ_PKT_OVERHEAD])
+        q->packet_overhead = nla_get_u32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
+
+    if (tb[TCA_THEATERQ_PRNG_SEED])
+        q->prng.seed = nla_get_u64(tb[TCA_THEATERQ_PRNG_SEED]);
+    else
+        q->prng.seed = get_random_u64();
+    prandom_seed_state(&q->prng.prng_state, q->prng.seed);
 
     printk(KERN_ERR "Theaterq is now: %d\n", q->stage);
 
@@ -781,6 +786,8 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
     q->stage = THEATERQ_STAGE_LOAD;
+    q->cont_mode = THEATERQ_CONT_HOLD;
+
     qdisc_watchdog_init(&q->watchdog, sch);
 
     if (!opt) return -EINVAL;
@@ -793,7 +800,11 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
 
     hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     q->timer.function = theaterq_timer_cb;
-    return theaterq_change(sch, opt, extack);
+    ret = theaterq_change(sch, opt, extack);
+    if (ret)
+        destroy_ingest_cdev(sch);
+
+    return ret;
 }
 
 static void theaterq_reset(struct Qdisc *sch)

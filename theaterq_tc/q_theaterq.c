@@ -12,41 +12,65 @@
 
 static void explain(void)
 {
-    fprintf(stderr, "Usage: ... theaterq mode [LOAD|RUN|CLEAR] cont [LOOP|HOLD|CLEAR]\n");
+    fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|CLEAR}]\n"
+                    "                    [cont {LOOP|HOLD|CLEAR}]\n"
+                    "                    [seed SEED]\n"
+                    "                    [overhead PACKETOVERHEAD]\n");
+}
+
+static void explain1(const char *arg)
+{
+    fprintf(stderr, "Illegal \"%s\"\n", arg);
 }
 
 static int theaterq_parse_opt(const struct qdisc_util *qu, int argc, 
                               char **argv, struct nlmsghdr *n, const char *dev)
 {
-    __u32 mode = THEATERQ_STAGE_LOAD;
-    __u32 cont = THEATERQ_CONT_HOLD;
+    __u32 stage = THEATERQ_STAGE_UNSPEC;
+    __u32 cont = THEATERQ_CONT_UNSPEC;
+    __s32 pkt_overhead = 0;
+    __u64 seed = 0;
+    bool has_seed = false;
     struct rtattr *tail;
 
     for ( ; argc > 0; --argc, ++argv) {
-        if (matches(*argv, "mode") == 0) {
+        if (matches(*argv, "stage") == 0) {
             NEXT_ARG();
             if (strcmp(*argv, "LOAD") == 0) {
-                mode = THEATERQ_STAGE_LOAD;
+                stage = THEATERQ_STAGE_LOAD;
             } else if (strcmp(*argv, "RUN") == 0) {
-                mode = THEATERQ_STAGE_RUN;
+                stage = THEATERQ_STAGE_RUN;
             } else if (strcmp(*argv, "CLEAR") == 0) {
-                mode = THEATERQ_STAGE_CLEAR;
+                stage = THEATERQ_STAGE_CLEAR;
             } else {
-                fprintf(stderr, "Unsupported mode \"%s\".\n", *argv);
+                fprintf(stderr, "Unsupported stage \"%s\".\n", *argv);
                 explain();
                 return -1;
             }
         } else if (matches(*argv, "cont") == 0) {
             NEXT_ARG();
             if (strcmp(*argv, "LOOP") == 0) {
-                mode = THEATERQ_CONT_LOOP;
+                cont = THEATERQ_CONT_LOOP;
             } else if (strcmp(*argv, "HOLD") == 0) {
-                mode = THEATERQ_CONT_HOLD;
+                cont = THEATERQ_CONT_HOLD;
             } else if (strcmp(*argv, "CLEAR") == 0) {
-                mode = THEATERQ_CONT_CLEAR;
+                cont = THEATERQ_CONT_CLEAR;
             } else {
                 fprintf(stderr, "Unsupported continue mode \"%s\".\n", *argv);
                 explain();
+                return -1;
+            }
+        } else if (matches(*argv, "seed") == 0) {
+            NEXT_ARG();
+            has_seed = true;
+            if (get_u64(&seed, *argv, 10)) {
+                explain1("seed");
+                return -1;
+            }
+        } else if (matches(*argv, "overhead") == 0) {
+            NEXT_ARG();
+            if (get_s32(&pkt_overhead, *argv, 0)) {
+                explain1("overhead");
                 return -1;
             }
         } else if (matches(*argv, "help") == 0) {
@@ -60,9 +84,20 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     }
 
     tail = addattr_nest(n, 1024, TCA_OPTIONS | NLA_F_NESTED);
-    addattr_l(n, 1024, TCA_THEATERQ_MODE, &mode, sizeof(mode));
-    addattr_l(n, 1024, TCA_THEATERQ_CONT_MODE, &cont, sizeof(cont));
+    if (stage && 
+        addattr_l(n, 1024, TCA_THEATERQ_STAGE, &stage, sizeof(stage)) < 0)
+            return -1;
+    if (cont && 
+        addattr_l(n, 1024, TCA_THEATERQ_CONT_MODE, &cont, sizeof(cont)) < 0)
+            return -1;
+    if (has_seed && 
+        addattr_l(n, 1024, TCA_THEATERQ_PRNG_SEED, &seed, sizeof(seed)) < 0)
+            return -1;
+    if (pkt_overhead && 
+        addattr_l(n, 1024, TCA_THEATERQ_PKT_OVERHEAD, &pkt_overhead, sizeof(pkt_overhead)) < 0)
+            return -1;
     addattr_nest_end(n, tail);
+
     fprintf(stderr, "Please ingest Trace File using /dev/theaterq:eth1:10:0.\n");
     return 0;
 }

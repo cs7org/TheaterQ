@@ -9,7 +9,7 @@ all: q_theaterq.c
 	cp -v q_theaterq.c $(IPR2_TC)/.
 	cp -v ../theaterq_lkm/include/uapi/linux/pkt_sch_theaterq.h $(IPR2_UAPI)/.
 	make -C $(IPR2) -j$(nproc --ignore 1) TCSO=q_theaterq.so all
-	mkdir $(TC_LIB)
+	mkdir -p $(TC_LIB)
 	cp $(IPR2_TC)/q_theaterq.so $(TC_LIB)/.
 clean:
 	make -C $(IPR2) clean
