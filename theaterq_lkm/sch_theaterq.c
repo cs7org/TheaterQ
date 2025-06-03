@@ -80,9 +80,10 @@ struct theaterq_sched_data {
     struct theaterq_entry *e_head;
     struct theaterq_entry *e_tail;
     u64 e_entries;
+    u64 e_current;
 
     struct ingest_cdev {
-        char name[64];
+        char name[THEATERQ_CDEV_MAX_NAMELEN];
         bool en;
         struct class *cls;
         struct device *device;
@@ -476,6 +477,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
     if (!q->current_entry->next) {
         switch (q->cont_mode) {
             case THEATERQ_CONT_LOOP:
+                q->e_current = 0;
                 WRITE_ONCE(q->current_entry, q->e_head);
                 break;
 
@@ -485,17 +487,19 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
                 // No fallthrough, gcc does not allow it after WRITE_ONCE
                 WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
                 q->t_running = 0;
+                q->e_current = 0;
                 return HRTIMER_NORESTART;
 
             case THEATERQ_CONT_HOLD:
                 /* fallthrough */
             default:
                 WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
-                q->t_running = 0;
+                q->e_current = 0;
                 return HRTIMER_NORESTART;
         }
     } else {
         WRITE_ONCE(q->current_entry, q->current_entry->next);
+        q->e_current++;
     }
 
     printk(KERN_INFO "Enabled entry: %llu\n", q->current_entry->latency);
@@ -696,6 +700,7 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
         return EINVAL;
 
     q->current_entry = q->e_head;
+    q->e_current = 0;
 
     if (!q->current_entry->next)
         return -EINVAL;
@@ -830,7 +835,35 @@ static void theaterq_destroy(struct Qdisc *sch)
 
 static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
 {
-    return 0;
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+    struct nlattr *nla = (struct nlattr *) skb_tail_pointer(skb);
+
+    if (nla_put_u32(skb, TCA_THEATERQ_STAGE, q->stage))
+        goto nla_put_failure;
+
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_PRNG_SEED, q->prng.seed, TCA_THEATERQ_PAD))
+        goto nla_put_failure;
+
+    if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
+        goto nla_put_failure;
+    
+    if (nla_put_u32(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode))
+        goto nla_put_failure;
+    
+    if (nla_put(skb, TCA_THEATERQ_INGEST_CDEV, sizeof(q->ingest_cdev.name), q->ingest_cdev.name))
+        goto nla_put_failure;
+    
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_LEN, q->e_entries, TCA_THEATERQ_PAD))
+        goto nla_put_failure;
+    
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_POS, q->e_current, TCA_THEATERQ_PAD))
+        goto nla_put_failure;
+
+    return nla_nest_end(skb, nla);
+
+nla_put_failure:
+    nlmsg_trim(skb, nla);
+    return -1;
 }
 
 
