@@ -112,12 +112,13 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
     struct rtattr *tb[TCA_THEATERQ_MAX + 1];
+
     char present[TCA_THEATERQ_MAX + 1] = {};
 
     if (opt == NULL)
         return 0;
 
-    parse_rtattr(tb, TCA_THEATERQ_MAX, RTA_DATA(opt), RTA_PAYLOAD(opt));
+    parse_rtattr_nested(tb, TCA_THEATERQ_MAX, opt);
 
     if (tb[TCA_THEATERQ_STAGE]) {
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_STAGE]) < sizeof(stage))
@@ -202,7 +203,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     }
 
     if (present[TCA_THEATERQ_INGEST_CDEV])
-        print_string(PRINT_ANY, "ingest", " ingest %s", ingest_cdev);
+        print_string(PRINT_ANY, "ingest", " ingest /dev/%s", ingest_cdev);
 
     if (present[TCA_THEATERQ_ENTRY_LEN])
         print_u64(PRINT_ANY, "entries", " entries %llu", entry_count);

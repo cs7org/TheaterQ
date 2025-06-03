@@ -836,7 +836,10 @@ static void theaterq_destroy(struct Qdisc *sch)
 static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
-    struct nlattr *nla = (struct nlattr *) skb_tail_pointer(skb);
+    struct nlattr *opts = nla_nest_start(skb, TCA_OPTIONS);
+
+    if (!opts)
+        return -EMSGSIZE;
 
     if (nla_put_u32(skb, TCA_THEATERQ_STAGE, q->stage))
         goto nla_put_failure;
@@ -859,11 +862,16 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
     if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_POS, q->e_current, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
-    return nla_nest_end(skb, nla);
+    return nla_nest_end(skb, opts);
 
 nla_put_failure:
-    nlmsg_trim(skb, nla);
-    return -1;
+    nla_nest_cancel(skb, opts);
+    return -EMSGSIZE;
+}
+
+static int theaterq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+{
+    return 0;
 }
 
 
@@ -923,18 +931,19 @@ static const struct Qdisc_class_ops theaterq_class_ops = {
 };
 
 static struct Qdisc_ops theaterq_qdisc_ops __read_mostly = {
-    .id        = "theaterq",
-    .cl_ops    = &theaterq_class_ops,
-    .priv_size = sizeof(struct theaterq_sched_data),
-    .enqueue   = theaterq_enqueue,
-    .dequeue   = theaterq_dequeue,
-    .peek      = qdisc_peek_dequeued,
-    .init      = theaterq_init,
-    .reset     = theaterq_reset,
-    .destroy   = theaterq_destroy,
-    .change    = theaterq_change,
-    .dump      = theaterq_dump_qdisc,
-    .owner     = THIS_MODULE,
+    .id         = "theaterq",
+    .cl_ops     = &theaterq_class_ops,
+    .priv_size  = sizeof(struct theaterq_sched_data),
+    .enqueue    = theaterq_enqueue,
+    .dequeue    = theaterq_dequeue,
+    .peek       = qdisc_peek_dequeued,
+    .init       = theaterq_init,
+    .reset      = theaterq_reset,
+    .destroy    = theaterq_destroy,
+    .change     = theaterq_change,
+    .dump       = theaterq_dump_qdisc,
+    .dump_stats = theaterq_dump_stats,
+    .owner      = THIS_MODULE,
 };
 
 static int __init sch_theaterq_init(void)
