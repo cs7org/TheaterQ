@@ -48,6 +48,11 @@ enum {
     THEATERQ_CDEV_OPENED,
 };
 
+enum {
+    THEATERQ_HRTIMER_STOPPED,
+    THEATERQ_HRTIMER_RUNNING,
+};
+
 struct theaterq_sched_data {
     struct rb_root t_root;
     struct sk_buff *t_head;
@@ -87,9 +92,9 @@ struct theaterq_sched_data {
         char lbuf[THEATERQ_INGEST_MAXLEN];
         size_t lpos;
     } ingest_helper;
-
+    
+    atomic_t t_running;
     struct hrtimer timer;
-    u32 t_running;
 };
 
 struct theaterq_skb_cb {
@@ -214,6 +219,41 @@ static void entry_list_clear(struct theaterq_sched_data *q)
     q->e_tail = NULL;
     q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
     q->e_entries = 0;
+}
+
+static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
+{
+    int ret = 0;
+
+    if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_STOPPED, 
+                       THEATERQ_HRTIMER_RUNNING))
+        return ret;
+
+    q->stage = THEATERQ_STAGE_RUN;
+
+    if (!q->e_head) {
+        ret = -EINVAL;
+        goto fail_reset;
+    }
+
+    WRITE_ONCE(q->current_entry, q->e_head);
+    q->current_entry = q->e_head;
+    q->e_current = 0;
+
+    if (!q->current_entry->next) {
+        ret = -EINVAL;
+        goto fail_reset;
+    }
+    
+    ktime_t delay = ns_to_ktime(q->current_entry->next->delay);
+    hrtimer_start(&q->timer, delay, HRTIMER_MODE_REL);
+    return ret;
+
+fail_reset:
+    atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
+    q->stage = THEATERQ_STAGE_LOAD;
+    q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
+    return ret;
 }
 
 // CHARDEV OPS ============================================================
@@ -462,7 +502,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
                                         struct theaterq_sched_data, timer);
     u64 next_delay;
 
-    if (!q->t_running)
+    if (atomic_read(&q->t_running) != THEATERQ_HRTIMER_RUNNING)
         return HRTIMER_NORESTART;
 
     if (!q->current_entry->next) {
@@ -477,7 +517,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
 
                 // No fallthrough, gcc does not allow it after WRITE_ONCE
                 WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
-                q->t_running = 0;
+                atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
                 q->e_current = 0;
                 return HRTIMER_NORESTART;
 
@@ -509,6 +549,10 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct theaterq_skb_cb *cb;
+
+    if (READ_ONCE(q->stage) == THEATERQ_STAGE_ARM) {
+        (void) theaterq_run_hrtimer(q);
+    }
 
     struct theaterq_entry *current_entry = READ_ONCE(q->current_entry);
     s64 now = ktime_get_ns();
@@ -682,32 +726,12 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
 };
 
-static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
-{
-    if (q->t_running)
-        return 0;
-
-    if (!q->e_head)
-        return EINVAL;
-
-    q->current_entry = q->e_head;
-    q->e_current = 0;
-
-    if (!q->current_entry->next)
-        return -EINVAL;
-    
-    ktime_t delay = ns_to_ktime(q->current_entry->next->delay);
-    q->t_running = 1;
-    hrtimer_start(&q->timer, delay, HRTIMER_MODE_REL);
-    return 0;
-}
-
 static void theaterq_stop_hrtimer(struct theaterq_sched_data *q)
 {
-    if (!q->t_running)
+    if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_RUNNING, 
+                       THEATERQ_HRTIMER_STOPPED))
         return;
 
-    q->t_running = 0;
     hrtimer_cancel(&q->timer);
 }
 
@@ -736,7 +760,6 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         } else if (new_stage == THEATERQ_STAGE_LOAD && 
                    q->stage != new_stage) {
             theaterq_stop_hrtimer(q);
-            entry_list_clear(q);
         } else if (new_stage == THEATERQ_STAGE_RUN) {
             if (!q->e_entries) {
                 ret = -ENODATA;
@@ -799,6 +822,8 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
 
     hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     q->timer.function = theaterq_timer_cb;
+    atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
+
     ret = theaterq_change(sch, opt, extack);
     if (ret)
         destroy_ingest_cdev(sch);
@@ -882,7 +907,6 @@ static int theaterq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 {
     return 0;
 }
-
 
 // CLASS OPS ==============================================================
 

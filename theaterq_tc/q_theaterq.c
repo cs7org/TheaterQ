@@ -12,7 +12,7 @@
 
 static void explain(void)
 {
-    fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|CLEAR}]\n"
+    fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|ARM|CLEAR}]\n"
                     "                    [cont {LOOP|HOLD|CLEAR}]\n"
                     "                    [seed SEED]\n"
                     "                    [overhead PACKETOVERHEAD]\n");
@@ -40,6 +40,8 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 stage = THEATERQ_STAGE_LOAD;
             } else if (strcmp(*argv, "RUN") == 0) {
                 stage = THEATERQ_STAGE_RUN;
+            } else if (strcmp(*argv, "ARM") == 0) {
+                stage = THEATERQ_STAGE_ARM;
             } else if (strcmp(*argv, "CLEAR") == 0) {
                 stage = THEATERQ_STAGE_CLEAR;
             } else {
@@ -187,6 +189,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
             stage_str = "LOAD";
         else if (stage == THEATERQ_STAGE_RUN)
             stage_str = "RUN";
+        else if (stage == THEATERQ_STAGE_ARM)
+            stage_str = "ARM";
         else if (stage == THEATERQ_STAGE_FINISH)
             stage_str = "FINISH";
 
