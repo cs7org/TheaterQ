@@ -111,9 +111,13 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     char *ingest_cdev = NULL;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
-    struct rtattr *tb[TCA_THEATERQ_MAX + 1];
+    struct theaterq_entry *entry_current = NULL;
+    char cdev_buf[THEATERQ_CDEV_MAX_NAMELEN + sizeof(THEATERQ_CDEV_PREFIX)] = {};
 
+    struct rtattr *tb[TCA_THEATERQ_MAX + 1];
     char present[TCA_THEATERQ_MAX + 1] = {};
+
+    SPRINT_BUF(b1);
 
     if (opt == NULL)
         return 0;
@@ -169,6 +173,13 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         present[TCA_THEATERQ_ENTRY_POS]++;
     }
 
+    if (tb[TCA_THEATERQ_ENTRY_CURRENT]) {
+        if (RTA_PAYLOAD(tb[TCA_THEATERQ_ENTRY_CURRENT]) < sizeof(*entry_current))
+            return -1;
+        entry_current = RTA_DATA(tb[TCA_THEATERQ_ENTRY_CURRENT]);
+        present[TCA_THEATERQ_ENTRY_CURRENT]++;
+    }
+
     if (present[TCA_THEATERQ_STAGE]) {
         char *stage_str = "INVALID";
 
@@ -202,14 +213,49 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         print_string(PRINT_ANY, "cont_mode", " cont_mode %s", cont_str);
     }
 
-    if (present[TCA_THEATERQ_INGEST_CDEV])
-        print_string(PRINT_ANY, "ingest", " ingest /dev/%s", ingest_cdev);
+    if (present[TCA_THEATERQ_INGEST_CDEV]) {
+        snprintf(cdev_buf, sizeof(cdev_buf), "%s%s", 
+                 THEATERQ_CDEV_PREFIX, ingest_cdev);
+
+        print_string(PRINT_ANY, "ingest", " ingest %s", cdev_buf);
+    }
 
     if (present[TCA_THEATERQ_ENTRY_LEN])
         print_u64(PRINT_ANY, "entries", " entries %llu", entry_count);
     
     if (present[TCA_THEATERQ_ENTRY_POS])
         print_u64(PRINT_ANY, "position", " position %llu", entry_pos);
+
+    if (present[TCA_THEATERQ_ENTRY_CURRENT]) {
+        open_json_object("current");
+
+        if (is_json_context()) {
+            print_float(PRINT_JSON, "delay", NULL, 
+                        (double) entry_current->latency / 1000000000.0);
+            print_float(PRINT_JSON, "jitter", NULL, 
+                        (double) entry_current->jitter / 1000000000.0);
+        } else {
+            print_string(PRINT_FP, NULL, " delay %s", 
+                         sprint_time64(entry_current->latency, b1));
+            if (entry_current->jitter != 0)
+                print_string(PRINT_FP, NULL, "  %s", 
+                             sprint_time64(entry_current->jitter, b1));
+        }
+
+        if (entry_current->rate != 0 || is_json_context())
+            tc_print_rate(PRINT_ANY, "rate", " rate %s", entry_current->rate);
+        
+        print_float(PRINT_JSON, "loss", NULL, 
+                        (1. * entry_current->loss) / UINT32_MAX);
+        if (entry_current->loss)
+            print_float(PRINT_FP, NULL, " loss", 
+                        (100. * entry_current->loss) / UINT32_MAX);
+
+        print_u64(PRINT_ANY, "limit", " limit %llu", 
+                  (__u64) entry_current->limit);
+
+        close_json_object();
+    }
 
     return 0;
 }

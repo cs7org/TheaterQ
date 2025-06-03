@@ -4,6 +4,7 @@
 #include <uapi/linux/pkt_sched.h>
 
 #define THEATERQ_CDEV_MAX_NAMELEN 64
+#define THEATERQ_CDEV_PREFIX "/dev/"
 
 enum {
     THEATERQ_STAGE_UNSPEC,
@@ -34,8 +35,19 @@ enum {
     TCA_THEATERQ_INGEST_CDEV,
     TCA_THEATERQ_ENTRY_LEN,
     TCA_THEATERQ_ENTRY_POS,
+    TCA_THEATERQ_ENTRY_CURRENT,
     __TCA_THEATERQ_MAX,
 };
 #define TCA_THEATERQ_MAX (__TCA_THEATERQ_MAX - 1)
+
+struct theaterq_entry {
+    __u64 delay;
+    __u64 latency;
+    __u64 jitter;
+    __u64 rate;
+    __u32 loss;
+    __u32 limit;
+    struct theaterq_entry *next;
+};
 
 #endif //__LINUX_PKT_SCH_THEATERQ_H

@@ -34,16 +34,6 @@ MODULE_VERSION("0.1");
 
 static struct kmem_cache *theaterq_cache = NULL;
 
-struct theaterq_entry {
-    u64 delay;
-    u64 latency;
-    u64 jitter;
-    u64 rate;
-    u32 loss;
-    u32 limit;
-    struct theaterq_entry *next;
-};
-
 static const struct theaterq_entry theaterq_default_entry = {
     .latency = 0ULL,
     .jitter = 0ULL,
@@ -70,6 +60,7 @@ struct theaterq_sched_data {
 
     struct prng {
         u64 seed;
+        bool seed_set;
         struct rnd_state prng_state;
     } prng;
 
@@ -192,8 +183,8 @@ static void tfifo_reset(struct Qdisc *sch)
     q->t_len = 0;
 }
 
-static __attribute__((unused)) struct sk_buff *theaterq_segment(struct sk_buff *skb, struct Qdisc *sch,
-                                        struct sk_buff **to_free)
+static __attribute__((unused)) struct sk_buff *theaterq_segment(
+            struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
 {
     struct sk_buff *segs;
     netdev_features_t features = netif_skb_features(skb);
@@ -766,10 +757,13 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     if (tb[TCA_THEATERQ_PKT_OVERHEAD])
         q->packet_overhead = nla_get_u32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
 
-    if (tb[TCA_THEATERQ_PRNG_SEED])
+    if (tb[TCA_THEATERQ_PRNG_SEED]) {
         q->prng.seed = nla_get_u64(tb[TCA_THEATERQ_PRNG_SEED]);
-    else
+        q->prng.seed_set = true;
+    } else {
         q->prng.seed = get_random_u64();
+        q->prng.seed_set = false;
+    }
     prandom_seed_state(&q->prng.prng_state, q->prng.seed);
 
     printk(KERN_ERR "Theaterq is now: %d\n", q->stage);
@@ -838,13 +832,16 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct nlattr *opts = nla_nest_start(skb, TCA_OPTIONS);
 
+    struct theaterq_entry current_entry;
+
     if (!opts)
         return -EMSGSIZE;
 
     if (nla_put_u32(skb, TCA_THEATERQ_STAGE, q->stage))
         goto nla_put_failure;
 
-    if (nla_put_u64_64bit(skb, TCA_THEATERQ_PRNG_SEED, q->prng.seed, TCA_THEATERQ_PAD))
+    if (q->prng.seed_set && nla_put_u64_64bit(skb, TCA_THEATERQ_PRNG_SEED, 
+                                              q->prng.seed, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
     if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
@@ -853,14 +850,26 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
     if (nla_put_u32(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode))
         goto nla_put_failure;
     
-    if (nla_put(skb, TCA_THEATERQ_INGEST_CDEV, sizeof(q->ingest_cdev.name), q->ingest_cdev.name))
+    if (nla_put(skb, TCA_THEATERQ_INGEST_CDEV, 
+                sizeof(q->ingest_cdev.name), q->ingest_cdev.name))
         goto nla_put_failure;
     
-    if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_LEN, q->e_entries, TCA_THEATERQ_PAD))
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_LEN, 
+                          q->e_entries, TCA_THEATERQ_PAD))
         goto nla_put_failure;
     
-    if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_POS, q->e_current, TCA_THEATERQ_PAD))
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_ENTRY_POS, 
+                          q->e_current, TCA_THEATERQ_PAD))
         goto nla_put_failure;
+
+    if (q->current_entry) {
+        memcpy(&current_entry, q->current_entry, sizeof(current_entry));
+        current_entry.next = NULL;
+
+        if (nla_put(skb, TCA_THEATERQ_ENTRY_CURRENT, 
+                    sizeof(current_entry), &current_entry))
+            goto nla_put_failure;
+    }
 
     return nla_nest_end(skb, opts);
 
