@@ -425,8 +425,6 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
         len -= to_copy;
         actual_read += to_copy;
     }
-
-    printk(KERN_ERR "Entries: %llu\n", q->e_entries);
     
     return actual_read;
 }
@@ -549,8 +547,6 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
         WRITE_ONCE(q->current_entry, q->current_entry->next);
         q->e_current++;
     }
-
-    printk(KERN_INFO "Enabled entry: %llu\n", q->current_entry->latency);
 
     if (q->current_entry->next)
         next_delay = q->current_entry->next->delay;
@@ -799,8 +795,6 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         q->prng.seed_set = false;
     }
     prandom_seed_state(&q->prng.prng_state, q->prng.seed);
-
-    printk(KERN_ERR "Theaterq is now: %d\n", q->stage);
 
     sch_tree_unlock(sch);
     if (run_hrtimer)
