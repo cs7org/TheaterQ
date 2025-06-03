@@ -202,7 +202,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     
     if (present[TCA_THEATERQ_PKT_OVERHEAD])
         print_s64(PRINT_ANY, "packet_overhead", 
-                  " packet_overhead %d", entry_count);
+                  " packet_overhead %d", pkt_overhead);
 
     if (present[TCA_THEATERQ_CONT_MODE]) {
         char *cont_str = "INVALID";
