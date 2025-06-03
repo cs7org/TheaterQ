@@ -51,4 +51,10 @@ struct theaterq_entry {
     struct theaterq_entry *next;
 };
 
+struct tc_theaterq_xstats {
+    __u64 looped;
+    __u64 total_time;
+    __u64 total_entries;
+};
+
 #endif //__LINUX_PKT_SCH_THEATERQ_H

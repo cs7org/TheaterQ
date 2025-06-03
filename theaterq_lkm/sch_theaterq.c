@@ -23,11 +23,6 @@
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
-MODULE_DESCRIPTION("Trace File based Link Emulator");
-MODULE_VERSION("0.1");
-
 // DATA + HELPER FUNCTIONS ================================================
 
 #define THEATERQ_INGEST_MAXLEN 256
@@ -95,6 +90,8 @@ struct theaterq_sched_data {
     
     atomic_t t_running;
     struct hrtimer timer;
+
+    struct tc_theaterq_xstats stats;
 };
 
 struct theaterq_skb_cb {
@@ -221,6 +218,13 @@ static void entry_list_clear(struct theaterq_sched_data *q)
     q->e_entries = 0;
 }
 
+static void theaterq_stats_clear(struct tc_theaterq_xstats *stats)
+{
+    stats->looped = 0;
+    stats->total_time = 0;
+    stats->total_entries = 0;
+}
+
 static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
 {
     int ret = 0;
@@ -246,6 +250,9 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
     }
     
     ktime_t delay = ns_to_ktime(q->current_entry->next->delay);
+    q->stats.total_time += delay;
+    q->stats.total_entries++;
+
     hrtimer_start(&q->timer, delay, HRTIMER_MODE_REL);
     return ret;
 
@@ -254,6 +261,15 @@ fail_reset:
     q->stage = THEATERQ_STAGE_LOAD;
     q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
     return ret;
+}
+
+static void theaterq_stop_hrtimer(struct theaterq_sched_data *q)
+{
+    if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_RUNNING, 
+                       THEATERQ_HRTIMER_STOPPED))
+        return;
+
+    hrtimer_cancel(&q->timer);
 }
 
 // CHARDEV OPS ============================================================
@@ -509,6 +525,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
         switch (q->cont_mode) {
             case THEATERQ_CONT_LOOP:
                 q->e_current = 0;
+                q->stats.looped++;
                 WRITE_ONCE(q->current_entry, q->e_head);
                 break;
 
@@ -539,6 +556,9 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
         next_delay = q->current_entry->next->delay;
     else
         next_delay = q->current_entry->delay;
+
+    q->stats.total_time += next_delay;
+    q->stats.total_entries++;
 
     hrtimer_forward_now(timer, ns_to_ktime(next_delay));
     return HRTIMER_RESTART;
@@ -726,15 +746,6 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
 };
 
-static void theaterq_stop_hrtimer(struct theaterq_sched_data *q)
-{
-    if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_RUNNING, 
-                       THEATERQ_HRTIMER_STOPPED))
-        return;
-
-    hrtimer_cancel(&q->timer);
-}
-
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
                            struct netlink_ext_ack *extack)
 {
@@ -819,6 +830,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     if (ret < 0) return ret;
 
     entry_list_clear(q);
+    theaterq_stats_clear(&q->stats);
 
     hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     q->timer.function = theaterq_timer_cb;
@@ -837,6 +849,8 @@ static void theaterq_reset(struct Qdisc *sch)
 
     qdisc_reset_queue(sch);
     tfifo_reset(sch);
+    theaterq_stop_hrtimer(q);
+    theaterq_stats_clear(&q->stats);
     if (q->qdisc) qdisc_reset(q->qdisc);
     qdisc_watchdog_cancel(&q->watchdog);
 }
@@ -905,7 +919,8 @@ nla_put_failure:
 
 static int theaterq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 {
-    return 0;
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+    return gnet_stats_copy_app(d, &q->stats, sizeof(q->stats));
 }
 
 // CLASS OPS ==============================================================
@@ -978,6 +993,11 @@ static struct Qdisc_ops theaterq_qdisc_ops __read_mostly = {
     .dump_stats = theaterq_dump_stats,
     .owner      = THIS_MODULE,
 };
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
+MODULE_DESCRIPTION("Trace File based Link Emulator");
+MODULE_VERSION("0.1");
 
 static int __init sch_theaterq_init(void)
 {

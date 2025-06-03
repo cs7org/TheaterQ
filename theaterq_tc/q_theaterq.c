@@ -267,6 +267,27 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
 static int theaterq_print_xstats(const struct qdisc_util *qu, FILE *f,
                                  struct rtattr *xstats)
 {
+    struct tc_theaterq_xstats _stats = {};
+    struct tc_theaterq_xstats *stats;
+
+    SPRINT_BUF(b1);
+
+    if (xstats == NULL)
+        return 0;
+
+    stats = RTA_DATA(xstats);
+    if (RTA_PAYLOAD(xstats) < sizeof(*stats)) {
+        memcpy(&_stats, stats, RTA_PAYLOAD(xstats));
+        stats = &_stats;
+    }
+
+    print_u64(PRINT_ANY, "looped", " looped %llu", stats->looped);
+    print_string(PRINT_FP, NULL, " duration %s", 
+                 sprint_time64(stats->total_time, b1));
+    print_float(PRINT_JSON, "duration", NULL, 
+                (double) stats->total_time / 1000000000.0);
+    print_u64(PRINT_ANY, "entries", " entries %llu", stats->total_entries);
+
     return 0;
 }
 
