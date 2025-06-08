@@ -27,12 +27,21 @@ enum {
 #define THEATERQ_CONT_MAX (__THEATERQ_CONT_MAX - 1)
 
 enum {
+    THEATERQ_QUEUE_MODE_UNSPEC,
+    THEATERQ_QUEUE_MODE_PKT,
+    THEATERQ_QUEUE_MODE_BYTE,
+    __THEATERQ_QUEUE_MODE_MAX,
+};
+#define THEATERQ_QUEUE_MODE_MAX (__THEATERQ_QUEUE_MODE_MAX - 1)
+
+enum {
     TCA_THEATERQ_UNSPEC,
     TCA_THEATERQ_PAD,
     TCA_THEATERQ_STAGE,
     TCA_THEATERQ_PRNG_SEED,
     TCA_THEATERQ_PKT_OVERHEAD,
     TCA_THEATERQ_CONT_MODE,
+    TCA_THEATERQ_QUEUE_MODE,
     TCA_THEATERQ_INGEST_CDEV,
     TCA_THEATERQ_ENTRY_LEN,
     TCA_THEATERQ_ENTRY_POS,
@@ -55,6 +64,8 @@ struct tc_theaterq_xstats {
     __u64 looped;
     __u64 total_time;
     __u64 total_entries;
+    __u32 tfifo_plen;
+    __u64 tfifo_blen;
 };
 
 #endif //__LINUX_PKT_SCH_THEATERQ_H

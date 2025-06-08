@@ -14,6 +14,7 @@ static void explain(void)
 {
     fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|ARM|CLEAR}]\n"
                     "                    [cont {LOOP|HOLD|CLEAR}]\n"
+                    "                    [byteqlen]\n"
                     "                    [seed SEED]\n"
                     "                    [overhead PACKETOVERHEAD]\n");
 }
@@ -30,6 +31,7 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __u32 cont = THEATERQ_CONT_UNSPEC;
     __s32 pkt_overhead = 0;
     __u64 seed = 0;
+    __u32 use_byteq = THEATERQ_QUEUE_MODE_PKT; 
     bool has_seed = false;
     struct rtattr *tail;
 
@@ -62,6 +64,8 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 explain();
                 return -1;
             }
+        } else if (matches(*argv, "byteqlen")) {
+            use_byteq = THEATERQ_QUEUE_MODE_BYTE; 
         } else if (matches(*argv, "seed") == 0) {
             NEXT_ARG();
             has_seed = true;
@@ -98,6 +102,8 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     if (pkt_overhead && 
         addattr_l(n, 1024, TCA_THEATERQ_PKT_OVERHEAD, &pkt_overhead, sizeof(pkt_overhead)) < 0)
             return -1;
+    if (addattr_l(n, 1024, TCA_THEATERQ_QUEUE_MODE, &use_byteq, sizeof(use_byteq)) < 0)
+            return -1;
     addattr_nest_end(n, tail);
 
     return 0;
@@ -106,11 +112,12 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
 static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f, 
                               struct rtattr *opt)
 {
-    __u32 stage = 0;
+    __u32 stage = THEATERQ_STAGE_UNSPEC;
     __u64 seed = 0;
     __s32 pkt_overhead = 0;
-    __u32 cont = 0;
+    __u32 cont = THEATERQ_CONT_UNSPEC;
     char *ingest_cdev = NULL;
+    __u32 use_byteq = THEATERQ_QUEUE_MODE_UNSPEC;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
     struct theaterq_entry *entry_current = NULL;
@@ -204,6 +211,13 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         print_s64(PRINT_ANY, "packet_overhead", 
                   " packet_overhead %d", pkt_overhead);
 
+    if (present[TCA_THEATERQ_QUEUE_MODE]) {
+        char *qmode = "packetq";
+        if (use_byteq)
+            qmode = "byteq";
+        print_string(PRINT_ANY, "queue", " queue %s", qmode);
+    }
+
     if (present[TCA_THEATERQ_CONT_MODE]) {
         char *cont_str = "INVALID";
 
@@ -281,6 +295,10 @@ static int theaterq_print_xstats(const struct qdisc_util *qu, FILE *f,
         stats = &_stats;
     }
 
+    print_u64(PRINT_FP, NULL, " tfifo %llub", stats->tfifo_blen);
+    print_u64(PRINT_FP, NULL, " %llup", stats->tfifo_plen);
+    print_u64(PRINT_JSON, "tfifo_blen", NULL, stats->tfifo_blen);
+    print_u64(PRINT_JSON, "tfifo_plen", NULL, stats->tfifo_plen);
     print_u64(PRINT_ANY, "looped", " looped %llu", stats->looped);
     print_string(PRINT_FP, NULL, " duration %s", 
                  sprint_time64(stats->total_time, b1));
