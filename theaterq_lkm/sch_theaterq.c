@@ -316,19 +316,27 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
     char kbuf[THEATERQ_INGEST_MAXLEN];
     size_t actual_read = 0;
 
-    if (len == 0)
+    if (len == 0) {
+        printk(KERN_WARNING
+               "sch_theaterq: Unable to parse line: Zero bytes read!\n");
         return -EINVAL;
+    }
     
     while (len > 0) {
         size_t to_copy = min(len, sizeof(kbuf));
-        if (copy_from_user(kbuf, buffer, to_copy))
+        if (copy_from_user(kbuf, buffer, to_copy)) {
+            printk(KERN_ERR "sch_theaterq: chardev: Unable to copy_from_user!\n");
             return -EFAULT;
+        }
 
         for (int i = 0; i < to_copy; i++) {
             char c = kbuf[i];
 
             if (q->ingest_helper.lpos >= THEATERQ_INGEST_MAXLEN - 1) {
                 q->ingest_helper.lpos = 0;
+                printk(KERN_WARNING 
+                       "sch_theaterq: Unable to parse too long line at entry %llu!\n", 
+                        q->e_entries + 1);
                 return -EINVAL;
             }
 
@@ -364,7 +372,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                         token = strsep(&p, ","); \
                         if (!token || fun(token, 10, dest)) { \
                             printk(KERN_WARNING \
-                                  "sch_theaterq: Parsing error at pos %u\n", i); \
+                                  "sch_theaterq: Parsing error at pos %u in entry %llu\n", \
+                                  i, q->e_entries + 1); \
                             q->ingest_helper.lpos = 0; \
                             return -EINVAL; \
                         } \
@@ -381,6 +390,9 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
 #undef PARSE_TOKEN
 
                 if (p && *p != '\0') {
+                    printk(KERN_WARNING 
+                           "sch_theaterq: Unable to parse line: Unexpected input at entry %llu!\n",
+                           q->e_entries + 1);
                     return -EINVAL;
                 }
 
