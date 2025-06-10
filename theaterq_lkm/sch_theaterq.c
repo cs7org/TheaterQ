@@ -692,16 +692,18 @@ deliver:
     if (skb) {
         u64 time_to_send = theaterq_skb_cb(skb)->time_to_send;
         u64 now = ktime_get_ns();
+        unsigned int pkt_len = qdisc_pkt_len(skb);
 
         if (time_to_send <= now) {
             theaterq_erase_head(q, skb);
             q->t_len--;
+            q->t_blen -= pkt_len;
             skb->next = NULL;
             skb->prev = NULL;
             skb->dev = qdisc_dev(sch);
 
             if (q->qdisc) {
-                unsigned int pkt_len = qdisc_pkt_len(skb);
+                
                 struct sk_buff *to_free = NULL;
                 int err;
 
