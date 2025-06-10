@@ -116,11 +116,11 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     __u64 seed = 0;
     __s32 pkt_overhead = 0;
     __u32 cont = THEATERQ_CONT_UNSPEC;
-    char *ingest_cdev = NULL;
     __u32 use_byteq = THEATERQ_QUEUE_MODE_UNSPEC;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
     struct theaterq_entry *entry_current = NULL;
+    char *ingest_cdev = NULL;
     char cdev_buf[THEATERQ_CDEV_MAX_NAMELEN + sizeof(THEATERQ_CDEV_PREFIX)] = {};
 
     struct rtattr *tb[TCA_THEATERQ_MAX + 1];
@@ -201,7 +201,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         else if (stage == THEATERQ_STAGE_FINISH)
             stage_str = "FINISH";
 
-        print_string(PRINT_ANY, "stage", " stage %s", stage_str);
+        print_string(PRINT_ANY, "stage", "stage %s", stage_str);
     }
 
     if (present[TCA_THEATERQ_PRNG_SEED]) 

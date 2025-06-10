@@ -30,9 +30,9 @@ TheaterQ expects the following Trace File line format:
 - **`LATENCY`** and **`JITTER`**: Packet delay latency in ns.
 - **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`).
-- **`LIMIT`**: Currently available queue size as number of packets. Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue.
+- **`LIMIT`**: Currently available queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue.
 
-Parsing errors will be visible in `dmesg`.
+On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
 
 ## Usage
 Install the kernel module and set `TC_LIB_DIR`:
@@ -57,7 +57,7 @@ TheaterQ is used in the following way:
    ```
    - `stage ARM` will start the playback when the first packet is transmitted. `stage RUN` will start the playback immediately.
    - `cont LOOP` will restart at the beginning of the Trace File after the end was reached, `cont HOLD` will hold the last values of the Trace File, and `cont CLEAR` will reset the qdisc to transparent operation.
-   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details.
+   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length. 
 4. By using 
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage LOAD
