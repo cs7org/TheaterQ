@@ -69,6 +69,7 @@ struct theaterq_sched_data {
     u32 stage;
     u32 cont_mode;
     bool use_byte_queue;
+    bool allow_gso;
     struct theaterq_entry *current_entry;
     struct theaterq_entry *e_head;
     struct theaterq_entry *e_tail;
@@ -187,22 +188,6 @@ static void tfifo_reset(struct Qdisc *sch)
     q->t_tail = NULL;
     q->t_len = 0;
     q->t_blen = 0;
-}
-
-static __attribute__((unused)) struct sk_buff *theaterq_segment(
-            struct sk_buff *skb, struct Qdisc *sch, struct sk_buff **to_free)
-{
-    struct sk_buff *segs;
-    netdev_features_t features = netif_skb_features(skb);
-    segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
-
-    if (IS_ERR_OR_NULL(segs)) {
-        qdisc_drop(skb, sch, to_free);
-        return NULL;
-    }
-
-    consume_skb(skb);
-    return segs;
 }
 
 static void entry_list_clear(struct theaterq_sched_data *q)
@@ -576,8 +561,8 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
     return HRTIMER_RESTART;
 }
 
-static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
-                            struct sk_buff **to_free)
+static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
+                                struct sk_buff **to_free)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct theaterq_skb_cb *cb;
@@ -616,7 +601,7 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
     if (unlikely(current_entry && check_len >= current_entry->limit)) {
         qdisc_drop_all(skb, sch, to_free);
-        return NET_XMIT_DROP;
+        return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
     qdisc_qstats_backlog_inc(sch, skb);
@@ -656,6 +641,55 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     cb->time_to_send = now + delay;
     tfifo_enqueue(skb, sch);
     return NET_XMIT_SUCCESS;
+}
+
+static int theaterq_enqueue_gso(struct sk_buff *skb, struct Qdisc *sch,
+                                struct sk_buff **to_free)
+{
+    struct sk_buff *nskb;
+    u32 nb = 0, dropped = 0;
+    int ret = NET_XMIT_SUCCESS;
+    int flag = 0;
+
+    netdev_features_t features = netif_skb_features(skb);
+    struct sk_buff *segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+
+    if (IS_ERR_OR_NULL(segs))
+        return qdisc_drop(skb, sch, to_free);
+    
+    skb_list_walk_safe(segs, segs, nskb) {
+        skb_mark_not_on_list(segs);
+        qdisc_skb_cb(segs)->pkt_len = segs->len;
+
+        ret = theaterq_enqueue_seg(segs, sch, to_free); 
+        if ((ret & ~__NET_XMIT_BYPASS) == NET_XMIT_SUCCESS) {
+            if ((ret & __NET_XMIT_BYPASS) != 0) {
+                flag = __NET_XMIT_BYPASS;
+            }
+            nb++;
+        } else {
+            dropped++;
+        }
+    }
+
+    if (nb > 0) {
+        consume_skb(skb);
+        return dropped == 0 ? NET_XMIT_SUCCESS | flag : NET_XMIT_DROP;
+    }
+
+    kfree_skb(skb);
+    return NET_XMIT_DROP;
+}
+
+static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+                            struct sk_buff **to_free)
+{
+    struct theaterq_sched_data *q = qdisc_priv(sch);
+
+    if (skb_is_gso(skb) && !q->allow_gso)
+        return theaterq_enqueue_gso(skb, sch, to_free);
+    else
+        return theaterq_enqueue_seg(skb, sch, to_free);
 }
 
 static struct sk_buff *theaterq_peek(struct theaterq_sched_data *q)
@@ -763,7 +797,8 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_PRNG_SEED] = { .type = NLA_U64 },
     [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
     [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
-    [TCA_THEATERQ_QUEUE_MODE] = { .type = NLA_U32 },
+    [TCA_THEATERQ_USE_BYTEQ] = { .type = NLA_FLAG },
+    [TCA_THEATERQ_ALLOW_GSO] = { .type = NLA_FLAG },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -820,12 +855,11 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     }
     prandom_seed_state(&q->prng.prng_state, q->prng.seed);
 
-    if (tb[TCA_THEATERQ_QUEUE_MODE]) {
-        if (nla_get_u32(tb[TCA_THEATERQ_QUEUE_MODE]) == THEATERQ_QUEUE_MODE_BYTE)
-            q->use_byte_queue = true;
-        else
-            q->use_byte_queue = false;
-    }
+    if (tb[TCA_THEATERQ_USE_BYTEQ])
+        q->use_byte_queue = true;
+
+    if (tb[TCA_THEATERQ_ALLOW_GSO])
+        q->allow_gso = true;
 
     sch_tree_unlock(sch);
     if (run_hrtimer)
@@ -843,8 +877,11 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
+    sch->limit = __UINT32_MAX__;
+
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
+    q->allow_gso = false;
 
     qdisc_watchdog_init(&q->watchdog, sch);
 
@@ -855,7 +892,6 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     if (ret < 0) return ret;
 
     entry_list_clear(q);
-    theaterq_stats_clear(&q->stats);
 
     hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     q->timer.function = theaterq_timer_cb;
@@ -926,8 +962,7 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
                           q->e_current, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
-    if (nla_put_u32(skb, TCA_THEATERQ_QUEUE_MODE, 
-                    q->use_byte_queue ? THEATERQ_QUEUE_MODE_BYTE : THEATERQ_QUEUE_MODE_PKT))
+     if (q->use_byte_queue && nla_put_flag(skb, TCA_THEATERQ_USE_BYTEQ))
         goto nla_put_failure;
 
     if (q->current_entry) {
@@ -938,6 +973,9 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
                     sizeof(current_entry), &current_entry))
             goto nla_put_failure;
     }
+
+    if (q->allow_gso && nla_put_flag(skb, TCA_THEATERQ_ALLOW_GSO))
+        goto nla_put_failure;
 
     return nla_nest_end(skb, opts);
 

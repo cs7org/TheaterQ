@@ -15,6 +15,7 @@ static void explain(void)
     fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|ARM|CLEAR}]\n"
                     "                    [cont {LOOP|HOLD|CLEAR}]\n"
                     "                    [byteqlen]\n"
+                    "                    [allow_gso]\n"
                     "                    [seed SEED]\n"
                     "                    [overhead PACKETOVERHEAD]\n");
 }
@@ -31,7 +32,8 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __u32 cont = THEATERQ_CONT_UNSPEC;
     __s32 pkt_overhead = 0;
     __u64 seed = 0;
-    __u32 use_byteq = THEATERQ_QUEUE_MODE_PKT; 
+    bool use_byteq = false; 
+    bool allow_gso = false;
     bool has_seed = false;
     struct rtattr *tail;
 
@@ -65,7 +67,9 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 return -1;
             }
         } else if (matches(*argv, "byteqlen")) {
-            use_byteq = THEATERQ_QUEUE_MODE_BYTE; 
+            use_byteq = true; 
+        } else if (matches(*argv, "allow_gso")) {
+            allow_gso = true;
         } else if (matches(*argv, "seed") == 0) {
             NEXT_ARG();
             has_seed = true;
@@ -102,7 +106,9 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     if (pkt_overhead && 
         addattr_l(n, 1024, TCA_THEATERQ_PKT_OVERHEAD, &pkt_overhead, sizeof(pkt_overhead)) < 0)
             return -1;
-    if (addattr_l(n, 1024, TCA_THEATERQ_QUEUE_MODE, &use_byteq, sizeof(use_byteq)) < 0)
+    if (use_byteq && addattr_l(n, 1024, TCA_THEATERQ_USE_BYTEQ, &use_byteq, sizeof(use_byteq)) < 0)
+            return -1;
+    if (allow_gso && addattr_l(n, 1024, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(allow_gso)) < 0)
             return -1;
     addattr_nest_end(n, tail);
 
@@ -116,7 +122,6 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     __u64 seed = 0;
     __s32 pkt_overhead = 0;
     __u32 cont = THEATERQ_CONT_UNSPEC;
-    __u32 use_byteq = THEATERQ_QUEUE_MODE_UNSPEC;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
     struct theaterq_entry *entry_current = NULL;
@@ -211,12 +216,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         print_s64(PRINT_ANY, "packet_overhead", 
                   " packet_overhead %d", pkt_overhead);
 
-    if (present[TCA_THEATERQ_QUEUE_MODE]) {
-        char *qmode = "packetq";
-        if (use_byteq)
-            qmode = "byteq";
-        print_string(PRINT_ANY, "queue", " queue %s", qmode);
-    }
+    print_on_off(PRINT_ANY, "bytequeue", " bytequeue %s", tb[TCA_THEATERQ_USE_BYTEQ]);
+    print_on_off(PRINT_ANY, "allow_gso", " allow_gso %s", tb[TCA_THEATERQ_ALLOW_GSO]);
 
     if (present[TCA_THEATERQ_CONT_MODE]) {
         char *cont_str = "INVALID";

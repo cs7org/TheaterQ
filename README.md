@@ -57,7 +57,7 @@ TheaterQ is used in the following way:
    ```
    - `stage ARM` will start the playback when the first packet is transmitted. `stage RUN` will start the playback immediately.
    - `cont LOOP` will restart at the beginning of the Trace File after the end was reached, `cont HOLD` will hold the last values of the Trace File, and `cont CLEAR` will reset the qdisc to transparent operation.
-   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length. 
+   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length.  The `allow_gso` flag disables automatic GSO packet segmentation.
 4. By using 
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage LOAD
