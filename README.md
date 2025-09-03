@@ -4,7 +4,7 @@
 Build & Install:
 ```bash
 # Install the required dependencies, e.g. on Debian:
-# sudo apt install linux-headers-generic build-essentials make
+# sudo apt install linux-headers-generic build-essential make
 
 cd theaterq_lkm
 make all
@@ -46,7 +46,7 @@ TheaterQ is used in the following way:
    ```bash
    tc qdisc add dev <oif> root handle <major> theaterq
    ```
-   Since the TheaterQ is classfull, it is possible to install other qdiscs as its child. After installing TheaterQ it will first run transparently (no delays, no packet loss).
+   Since the TheaterQ is classful, it is possible to install other qdiscs as its child. After installing TheaterQ it will first run transparently (no delays, no packet loss).
 2. The TheaterQ instance is now in the `LOAD` stage. A character device at `/dev/theaterq:<oif>:<major>:0` is available to ingest the Trace Files.
    ```bash
    cat tracefile > /dev/theaterq:<oif>:<major>:0

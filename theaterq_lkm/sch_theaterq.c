@@ -23,7 +23,7 @@
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
-// DATA + HELPER FUNCTIONS ================================================
+// DATA + HELPER FUNCTIONS =====================================================
 
 #define THEATERQ_INGEST_MAXLEN 256
 
@@ -115,7 +115,8 @@ static inline bool loss_event(struct theaterq_sched_data *q)
            q->current_entry->loss >= prandom_u32_state(&q->prng.prng_state);
 }
 
-static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng) {
+static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
+{
     u32 rnd;
 
     if (sigma == 0)
@@ -261,7 +262,7 @@ static void theaterq_stop_hrtimer(struct theaterq_sched_data *q)
     hrtimer_cancel(&q->timer);
 }
 
-// CHARDEV OPS ============================================================
+// CHARDEV OPS =================================================================
 
 static int ingest_cdev_open(struct inode *inode, struct file *filp)
 {
@@ -509,7 +510,7 @@ static int destroy_ingest_cdev(struct Qdisc *sch)
     return 0;
 }
 
-// QDISC OPS ==============================================================
+// QDISC OPS ===================================================================
 
 static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
 {
@@ -529,7 +530,8 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
                 break;
 
             case THEATERQ_CONT_CLEAR:
-                WRITE_ONCE(q->current_entry, (struct theaterq_entry *) &theaterq_default_entry);
+                WRITE_ONCE(q->current_entry, 
+                           (struct theaterq_entry *) &theaterq_default_entry);
 
                 // No fallthrough, gcc does not allow it after WRITE_ONCE
                 WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
@@ -997,7 +999,7 @@ static int theaterq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
     return gnet_stats_copy_app(d, &stats, sizeof(stats));
 }
 
-// CLASS OPS ==============================================================
+// CLASS OPS ===================================================================
 
 static int theaterq_graft(struct Qdisc *sch, unsigned long arg, 
                           struct Qdisc *new, struct Qdisc **old,
@@ -1042,7 +1044,7 @@ static int theaterq_dump_class(struct Qdisc *sch, unsigned long cl,
     return 0;
 }
 
-// MODULE BOOTSTRAP =======================================================
+// MODULE BOOTSTRAP ============================================================
 
 static const struct Qdisc_class_ops theaterq_class_ops = {
     .graft = theaterq_graft,
