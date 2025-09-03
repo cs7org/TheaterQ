@@ -29,7 +29,7 @@
 #define THEATERQ_INGEST_MAXLEN 256
 
 static struct kmem_cache *theaterq_cache = NULL;
-static u8 syngrps = 8:
+static u8 syngrps = 8;
 static u8 syngrps_members = 8;
 
 static const struct theaterq_entry theaterq_default_entry = {
@@ -1123,7 +1123,7 @@ static int __init sch_theaterq_init(void)
     int i;
 
     if (!theaterq_syngrps) {
-        printk(KERN_ERR, "theaterq: Unable kmalloc for syncgroups");
+        printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups");
         kmem_cache_destroy(theaterq_cache);
         return -ENOMEM;
     }
@@ -1131,10 +1131,10 @@ static int __init sch_theaterq_init(void)
     for (i = 0; i < syngrps; i++) {
         theaterq_syngrps[i].index = i;
 
-        theaterq_syngrps[i].members = kzalloc_array(syngrps_members, 
+        theaterq_syngrps[i].members = kzalloc(syngrps_members *
                             sizeof(struct theaterq_syngrp_member), GFP_KERNEL);
         if (!theaterq_syngrps[i].members) {
-            printk(KERN_ERR, "theaterq: Unable kmalloc for syncgroups");
+            printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups");
             goto cleanup_members;
         }
     }

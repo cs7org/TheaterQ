@@ -91,7 +91,6 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 explain1("syncgroup");
                 return -1;
             }
-        }
         } else if (matches(*argv, "help") == 0) {
             explain();
             return -1;
@@ -238,7 +237,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                   " packet_overhead %d", pkt_overhead);
 
     if (present[TCA_THEATERQ_SYNCGRP] && syncgroup != 0)
-        print_u8(PRINT_ANY, "syncgroup", 
+        print_u64(PRINT_ANY, "syncgroup", 
                  " syncgroup %d", syncgroup);
 
     print_on_off(PRINT_ANY, "bytequeue", 
