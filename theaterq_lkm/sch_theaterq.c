@@ -20,6 +20,7 @@
 #include <net/sock.h>
 #include <linux/atomic.h>
 #include <linux/cdev.h>
+#include <linux/moduleparam.h>
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
@@ -28,6 +29,8 @@
 #define THEATERQ_INGEST_MAXLEN 256
 
 static struct kmem_cache *theaterq_cache = NULL;
+static u8 syngrps = 8:
+static u8 syngrps_members = 8;
 
 static const struct theaterq_entry theaterq_default_entry = {
     .latency = 0ULL,
@@ -94,8 +97,21 @@ struct theaterq_sched_data {
     atomic_t t_running;
     struct hrtimer timer;
 
+    u8 syncgroup;
+
     struct tc_theaterq_xstats stats;
 };
+
+struct theaterq_syngrp_member {
+    struct theaterq_sched_data *sched_data;
+};
+
+struct theaterq_syngrp {
+    u8 index;
+    struct theaterq_syngrp_member *members;
+};
+
+static struct theaterq_syngrp *theaterq_syngrps = NULL;
 
 struct theaterq_skb_cb {
     u64 time_to_send;
@@ -801,6 +817,7 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
     [TCA_THEATERQ_USE_BYTEQ] = { .type = NLA_FLAG },
     [TCA_THEATERQ_ALLOW_GSO] = { .type = NLA_FLAG },
+    [TCA_THEATERQ_SYNCGRP] = { .type = NLA_U8 },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -848,6 +865,9 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     if (tb[TCA_THEATERQ_PKT_OVERHEAD])
         q->packet_overhead = nla_get_u32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
 
+    if (tb[TCA_THEATERQ_SYNCGRP])
+        q->syncgroup = nla_get_u8(tb[TCA_THEATERQ_SYNCGRP]);
+
     if (tb[TCA_THEATERQ_PRNG_SEED]) {
         q->prng.seed = nla_get_u64(tb[TCA_THEATERQ_PRNG_SEED]);
         q->prng.seed_set = true;
@@ -884,6 +904,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
     q->allow_gso = false;
+    q->syncgroup = 0;
 
     qdisc_watchdog_init(&q->watchdog, sch);
 
@@ -947,6 +968,9 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
         goto nla_put_failure;
 
     if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
+        goto nla_put_failure;
+
+    if (nla_put_u8(skb, TCA_THEATERQ_SYNCGRP, q->syncgroup))
         goto nla_put_failure;
     
     if (nla_put_u32(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode))
@@ -1075,6 +1099,14 @@ MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
 MODULE_DESCRIPTION("Trace File based Link Emulator");
 MODULE_VERSION("0.1");
 
+module_param(syngrps, byte, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(syngrps, 
+                 "Maximum synchronization groups (u8, default=8)");
+
+module_param(syngrps_members, byte, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(syngrps_members, 
+                 "Maximum members per synchronization group (u8, default=8)");
+
 static int __init sch_theaterq_init(void)
 {
     theaterq_cache = kmem_cache_create("theaterq_cache",
@@ -1086,13 +1118,54 @@ static int __init sch_theaterq_init(void)
         return -ENOMEM;
     }
 
+    theaterq_syngrps = kmalloc_array(syngrps, sizeof(struct theaterq_syngrp), 
+                                     GFP_KERNEL);
+    int i;
+
+    if (!theaterq_syngrps) {
+        printk(KERN_ERR, "theaterq: Unable kmalloc for syncgroups");
+        kmem_cache_destroy(theaterq_cache);
+        return -ENOMEM;
+    }
+
+    for (i = 0; i < syngrps; i++) {
+        theaterq_syngrps[i].index = i;
+
+        theaterq_syngrps[i].members = kzalloc_array(syngrps_members, 
+                            sizeof(struct theaterq_syngrp_member), GFP_KERNEL);
+        if (!theaterq_syngrps[i].members) {
+            printk(KERN_ERR, "theaterq: Unable kmalloc for syncgroups");
+            goto cleanup_members;
+        }
+    }
+
     return register_qdisc(&theaterq_qdisc_ops);
+
+cleanup_members:
+    while (--i >= 0) {
+        kfree(theaterq_syngrps[i].members);
+    }
+
+    kfree(theaterq_syngrps);
+    theaterq_syngrps = NULL;
+    return -ENOMEM;
 }
 
 static void __exit sch_theaterq_exit(void)
 {
-    if (theaterq_cache)
+    if (theaterq_cache) {
         kmem_cache_destroy(theaterq_cache);
+        theaterq_cache = NULL;
+    }
+
+    if (theaterq_syngrps) {
+        for (int i = 0; i < syngrps; i++) {
+            kfree(theaterq_syngrps[i].members);
+        }
+    }
+
+    kfree(theaterq_syngrps);
+    theaterq_syngrps = NULL;
 
     unregister_qdisc(&theaterq_qdisc_ops);
 }
