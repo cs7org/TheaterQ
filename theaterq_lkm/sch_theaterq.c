@@ -95,6 +95,7 @@ struct theaterq_sched_data {
     } ingest_helper;
     
     atomic_t t_running;
+    u64 t_started;
     struct hrtimer timer;
 
     u8 syncgroup;
@@ -240,6 +241,7 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
         return ret;
 
     q->stage = THEATERQ_STAGE_RUN;
+    q->t_started = ktime_get_ns();
 
     if (!q->e_head) {
         ret = -EINVAL;
@@ -254,12 +256,12 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
         ret = -EINVAL;
         goto fail_reset;
     }
-    
-    ktime_t delay = ns_to_ktime(q->current_entry->next->delay);
-    q->stats.total_time += delay;
-    q->stats.total_entries++;
 
-    hrtimer_start(&q->timer, delay, HRTIMER_MODE_REL);
+    q->stats.total_time = q->current_entry->next->delay;
+    q->stats.total_entries++;
+    ktime_t delay = ktime_set(0, q->stats.total_time);
+
+    hrtimer_start(&q->timer, delay, HRTIMER_MODE_ABS);
     return ret;
 
 fail_reset:
@@ -575,7 +577,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
     q->stats.total_time += next_delay;
     q->stats.total_entries++;
 
-    hrtimer_forward_now(timer, ns_to_ktime(next_delay));
+    hrtimer_forward(timer, ktime_set(0, q->t_started + q->stats.total_time), next_delay);
     return HRTIMER_RESTART;
 }
 
@@ -916,7 +918,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
 
     entry_list_clear(q);
 
-    hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
     q->timer.function = theaterq_timer_cb;
     atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
 
@@ -1118,7 +1120,8 @@ static int __init sch_theaterq_init(void)
         return -ENOMEM;
     }
 
-    theaterq_syngrps = kmalloc_array(syngrps, sizeof(struct theaterq_syngrp), 
+    theaterq_syngrps = kmalloc_array(((u32) syngrps) + 1, 
+                                     sizeof(struct theaterq_syngrp), 
                                      GFP_KERNEL);
     int i;
 

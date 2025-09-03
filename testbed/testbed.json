@@ -1,0 +1,103 @@
+{
+    "settings": {
+        "management_network": "auto",
+        "diskimage_basepath": "/images"
+    },
+    "networks": [
+        {
+            "name": "link_a",
+            "host_ports": []
+        },
+        {
+            "name": "link_b",
+            "host_ports": []
+        }
+    ],
+    "integrations": [],
+    "instances": [
+        {
+            "name": "vma",
+            "diskimage": "debian-iperf.qcow2",
+            "setup_script": "setup_client.sh",
+            "environment": {
+                "IP_ADDRESS": "10.0.0.1/24",
+                "ROUTE": "10.0.1.0/24 via 10.0.0.2"
+            },
+            "cores": 2,
+            "memory": 1024,
+            "networks": ["link_a"],
+            "applications": [
+                {
+                    "application": "ping",
+                    "name": "a-ping-probe",
+                    "delay": 1,
+                    "runtime": 1,
+                    "settings": {
+                        "target": "10.0.1.1"
+                    },
+                    "dont_store": true
+                },
+                {
+                    "application": "ping",
+                    "name": "a-ping",
+                    "delay": 10,
+                    "runtime": 20,
+                    "settings": {
+                        "target": "10.0.1.1",
+                        "interval": 0.1,
+                        "timeout": 1
+                    }
+                }
+            ],
+            "preserve_files": []
+        },
+        {
+            "name": "router",
+            "diskimage": "debian-iperf.qcow2",
+            "setup_script": "setup_emulator.sh",
+            "environment": {
+                "FORWARD_LINK": "eth1",
+                "RETURN_LINK": "eth2",
+                "FORWARD_TRACE": "{{ FORWARD_TRACE }}",
+                "RETURN_TRACE": "{{ RETURN_TRACE }}"
+            },
+            "cores": 2,
+            "memory": 1024,
+            "networks": ["link_a", "link_b"],
+            "applications": [
+                {
+                    "application": "run-program",
+                    "name": "link-emulation",
+                    "delay": 0,
+                    "runtime": 30,
+                    "settings": {
+                        "command": "emulate.sh",
+                        "ignore_timeout": true,
+                        "environment": {
+                            "FORWARD_LINK": "eth1",
+                            "RETURN_LINK": "eth2",
+                            "FORWARD_TRACE": "{{ FORWARD_TRACE }}",
+                            "RETURN_TRACE": "{{ RETURN_TRACE }}"
+                        }
+                    },
+                    "dont_store": true
+                }
+            ],
+            "preserve_files": []
+        },
+        {
+            "name": "vmb",
+            "diskimage": "debian-iperf.qcow2",
+            "setup_script": "setup_client.sh",
+            "environment": {
+                "IP_ADDRESS": "10.0.1.1/24",
+                "ROUTE": "10.0.0.0/24 via 10.0.1.2"
+            },
+            "cores": 2,
+            "memory": 1024,
+            "networks": ["link_b"],
+            "applications": [],
+            "preserve_files": []
+        }
+    ]
+}
