@@ -33,10 +33,11 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __u32 cont = THEATERQ_CONT_UNSPEC;
     __s32 pkt_overhead = 0;
     __u64 seed = 0;
-    __u8 syncgroup = 0;
+    __s32 syncgroup = -1;
     bool use_byteq = false; 
     bool allow_gso = false;
     bool has_seed = false;
+    bool has_syncgroup = false;
     struct rtattr *tail;
 
     for ( ; argc > 0; --argc, ++argv) {
@@ -87,10 +88,19 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
             }
         } else if (matches(*argv, "syncgroup") == 0) {
             NEXT_ARG();
-            if (get_u8(&syncgroup, *argv, 0)) {
+            if (get_s32(&syncgroup, *argv, 0)) {
                 explain1("syncgroup");
                 return -1;
             }
+
+            if (syncgroup < -1 || syncgroup > UINT8_MAX) {
+                fprintf(stderr, "Invalid syncgroup \"%d\" (select from [-1,%d]).\n", 
+                        syncgroup, UINT8_MAX);
+                explain();
+                return -1;
+            }
+
+            has_syncgroup = true;
         } else if (matches(*argv, "help") == 0) {
             explain();
             return -1;
@@ -114,7 +124,7 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     if (pkt_overhead && 
         addattr_l(n, 1024, TCA_THEATERQ_PKT_OVERHEAD, &pkt_overhead, sizeof(pkt_overhead)) < 0)
             return -1;
-    if (syncgroup && 
+    if (has_syncgroup && 
         addattr_l(n, 1024, TCA_THEATERQ_SYNCGRP, &syncgroup, sizeof(syncgroup)) < 0)
             return -1;
     if (use_byteq && addattr_l(n, 1024, TCA_THEATERQ_USE_BYTEQ, &use_byteq, sizeof(use_byteq)) < 0)
@@ -132,7 +142,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     __u32 stage = THEATERQ_STAGE_UNSPEC;
     __u64 seed = 0;
     __s32 pkt_overhead = 0;
-    __u8 syncgroup = 0;
+    __s32 syncgroup = -1;
     __u32 cont = THEATERQ_CONT_UNSPEC;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
@@ -175,7 +185,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_SYNCGRP]) < sizeof(syncgroup))
             return -1;
 
-        syncgroup = rta_getattr_u8(tb[TCA_THEATERQ_SYNCGRP]);
+        syncgroup = rta_getattr_s32(tb[TCA_THEATERQ_SYNCGRP]);
         present[TCA_THEATERQ_SYNCGRP]++;
     }
 
@@ -236,8 +246,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         print_s64(PRINT_ANY, "packet_overhead", 
                   " packet_overhead %d", pkt_overhead);
 
-    if (present[TCA_THEATERQ_SYNCGRP] && syncgroup != 0)
-        print_u64(PRINT_ANY, "syncgroup", 
+    if (present[TCA_THEATERQ_SYNCGRP] && syncgroup != -1)
+        print_s64(PRINT_ANY, "syncgroup", 
                  " syncgroup %d", syncgroup);
 
     print_on_off(PRINT_ANY, "bytequeue", 

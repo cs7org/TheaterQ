@@ -29,6 +29,7 @@
 #define THEATERQ_INGEST_MAXLEN 256
 
 static struct kmem_cache *theaterq_cache = NULL;
+static DEFINE_SPINLOCK(theaterq_tree_lock);
 static u8 syngrps = 8;
 static u8 syngrps_members = 8;
 
@@ -50,6 +51,9 @@ enum {
     THEATERQ_HRTIMER_STOPPED,
     THEATERQ_HRTIMER_RUNNING,
 };
+
+// Forward declaration
+struct theaterq_syngrp;
 
 struct theaterq_sched_data {
     struct rb_root t_root;
@@ -98,18 +102,18 @@ struct theaterq_sched_data {
     u64 t_started;
     struct hrtimer timer;
 
-    u8 syncgroup;
+    struct theaterq_syngrp *syngrp;
 
     struct tc_theaterq_xstats stats;
 };
 
-struct theaterq_syngrp_member {
+/*struct theaterq_syngrp_member {
     struct theaterq_sched_data *sched_data;
-};
+};*/
 
 struct theaterq_syngrp {
-    u8 index;
-    struct theaterq_syngrp_member *members;
+    u16 index;
+    struct theaterq_sched_data *members[];
 };
 
 static struct theaterq_syngrp *theaterq_syngrps = NULL;
@@ -117,6 +121,59 @@ static struct theaterq_syngrp *theaterq_syngrps = NULL;
 struct theaterq_skb_cb {
     u64 time_to_send;
 };
+
+// SYNC GROUPS =================================================================
+
+static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q)
+{
+    /*
+        Called when:
+        - Any member is stopped (LOAD, CLEAR) by tc command
+
+        Will set all members to LOAD state, when they were in ARM, RUN, FINISHED
+        Stops hrtimers when required.
+    */
+}
+
+static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
+{
+    /*
+        Called when:
+        - Any member is set to RUN by tc command
+        - A meber in ARM was triggered
+
+        Set all members to RUN and start the hrtimers
+    */
+}
+
+static void theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 group)
+{
+    /*
+        Called when:
+        - Via tc command: syncgroup was 0 and is now != 0.
+
+        All members (including myself) must be in LOAD or FINISHED state.
+        (Cannot join an armed/running syncgroup)
+
+    */
+}
+
+static void theaterq_syncgroup_leave(struct theaterq_sched_data *q)
+{
+    /*
+        Called when:
+        - Via tc command: syncgroup_old != syncgroup_new
+
+        Leave will always be possible. Sets the own syncgroup also to NULL.
+    */
+}
+
+static void theaterq_syncgroup_change(struct theaterq_sched_data *q, s32 group)
+{
+    /*
+        Checks join/leave
+    */
+}
 
 static inline struct theaterq_skb_cb *theaterq_skb_cb(struct sk_buff *skb)
 {
@@ -232,9 +289,12 @@ static void theaterq_stats_clear(struct tc_theaterq_xstats *stats)
     stats->total_entries = 0;
 }
 
-static int theaterq_run_hrtimer(struct theaterq_sched_data *q)
+static int theaterq_run_hrtimer(struct theaterq_sched_data *q, bool group_members)
 {
     int ret = 0;
+
+    if (group_members)
+        theaterq_syncgroup_startall(q);
 
     if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_STOPPED, 
                        THEATERQ_HRTIMER_RUNNING))
@@ -271,8 +331,11 @@ fail_reset:
     return ret;
 }
 
-static void theaterq_stop_hrtimer(struct theaterq_sched_data *q)
+static void theaterq_stop_hrtimer(struct theaterq_sched_data *q, bool group_members)
 {
+    if (group_members)
+        theaterq_syncgroup_stopall(q);
+
     if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_RUNNING, 
                        THEATERQ_HRTIMER_STOPPED))
         return;
@@ -588,7 +651,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     struct theaterq_skb_cb *cb;
 
     if (READ_ONCE(q->stage) == THEATERQ_STAGE_ARM) {
-        (void) theaterq_run_hrtimer(q);
+        (void) theaterq_run_hrtimer(q, true);
     }
 
     struct theaterq_entry *current_entry = READ_ONCE(q->current_entry);
@@ -819,7 +882,7 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
     [TCA_THEATERQ_USE_BYTEQ] = { .type = NLA_FLAG },
     [TCA_THEATERQ_ALLOW_GSO] = { .type = NLA_FLAG },
-    [TCA_THEATERQ_SYNCGRP] = { .type = NLA_U8 },
+    [TCA_THEATERQ_SYNCGRP] = { .type = NLA_S32 },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -829,24 +892,25 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     struct nlattr *tb[TCA_THEATERQ_MAX + 1];
     int run_hrtimer = 0;
     int ret;
+    u32 new_stage = THEATERQ_STAGE_UNSPEC;
 
     ret = nla_parse_nested(tb, TCA_THEATERQ_MAX, opt, theaterq_policy, extack);
     if (ret < 0) return ret;
 
     sch_tree_lock(sch);
     if (tb[TCA_THEATERQ_STAGE]) {
-        u32 new_stage = nla_get_u32(tb[TCA_THEATERQ_STAGE]);
+        new_stage = nla_get_u32(tb[TCA_THEATERQ_STAGE]);
 
         if (new_stage == THEATERQ_STAGE_FINISH)
             new_stage = THEATERQ_STAGE_LOAD;
 
         if (new_stage == THEATERQ_STAGE_CLEAR) {
-            theaterq_stop_hrtimer(q);
+            theaterq_stop_hrtimer(q, true);
             entry_list_clear(q);
             new_stage = THEATERQ_STAGE_LOAD;
         } else if (new_stage == THEATERQ_STAGE_LOAD && 
                    q->stage != new_stage) {
-            theaterq_stop_hrtimer(q);
+            theaterq_stop_hrtimer(q, true);
         } else if (new_stage == THEATERQ_STAGE_RUN) {
             if (!q->e_entries) {
                 ret = -ENODATA;
@@ -857,8 +921,6 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 
             run_hrtimer = 1;
         }
-
-        q->stage = new_stage;
     }
 
     if (tb[TCA_THEATERQ_CONT_MODE])
@@ -868,7 +930,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         q->packet_overhead = nla_get_u32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
 
     if (tb[TCA_THEATERQ_SYNCGRP])
-        q->syncgroup = nla_get_u8(tb[TCA_THEATERQ_SYNCGRP]);
+         theaterq_syncgroup_change(q, nla_get_s32(tb[TCA_THEATERQ_SYNCGRP]));
 
     if (tb[TCA_THEATERQ_PRNG_SEED]) {
         q->prng.seed = nla_get_u64(tb[TCA_THEATERQ_PRNG_SEED]);
@@ -885,9 +947,13 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     if (tb[TCA_THEATERQ_ALLOW_GSO])
         q->allow_gso = true;
 
+    if (new_stage != THEATERQ_STAGE_UNSPEC)
+        q->stage = new_stage;
+
     sch_tree_unlock(sch);
+
     if (run_hrtimer)
-        ret = theaterq_run_hrtimer(q);
+        ret = theaterq_run_hrtimer(q, true);
     return ret;
 
 err_out:
@@ -906,7 +972,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
     q->allow_gso = false;
-    q->syncgroup = 0;
+    q->syngrp = NULL;
 
     qdisc_watchdog_init(&q->watchdog, sch);
 
@@ -935,7 +1001,8 @@ static void theaterq_reset(struct Qdisc *sch)
 
     qdisc_reset_queue(sch);
     tfifo_reset(sch);
-    theaterq_stop_hrtimer(q);
+    theaterq_stop_hrtimer(q, false);
+    theaterq_syncgroup_leave(q);
     theaterq_stats_clear(&q->stats);
     if (q->qdisc) qdisc_reset(q->qdisc);
     qdisc_watchdog_cancel(&q->watchdog);
@@ -945,8 +1012,9 @@ static void theaterq_destroy(struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
-    theaterq_stop_hrtimer(q);
+    theaterq_stop_hrtimer(q, false);
     qdisc_watchdog_cancel(&q->watchdog);
+    theaterq_syncgroup_leave(q);
     destroy_ingest_cdev(sch);
     entry_list_clear(q);
     if (q->qdisc) qdisc_put(q->qdisc);
@@ -971,8 +1039,9 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
 
     if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
         goto nla_put_failure;
-
-    if (nla_put_u8(skb, TCA_THEATERQ_SYNCGRP, q->syncgroup))
+    
+    s16 syncgroup = q->syngrp == NULL ? -1 : q->syngrp->index;
+    if (nla_put_s16(skb, TCA_THEATERQ_SYNCGRP, syncgroup))
         goto nla_put_failure;
     
     if (nla_put_u32(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode))
@@ -1121,9 +1190,8 @@ static int __init sch_theaterq_init(void)
     }
 
     theaterq_syngrps = kmalloc_array(((u32) syngrps) + 1, 
-                                     sizeof(struct theaterq_syngrp), 
+                                     sizeof(struct theaterq_syngrp) + syngrps_members * sizeof(struct theaterq_sched_data *), 
                                      GFP_KERNEL);
-    int i;
 
     if (!theaterq_syngrps) {
         printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups");
@@ -1131,27 +1199,12 @@ static int __init sch_theaterq_init(void)
         return -ENOMEM;
     }
 
-    for (i = 0; i < syngrps; i++) {
+    for (s32 i = 0; i < syngrps; i++) {
         theaterq_syngrps[i].index = i;
-
-        theaterq_syngrps[i].members = kzalloc(syngrps_members *
-                            sizeof(struct theaterq_syngrp_member), GFP_KERNEL);
-        if (!theaterq_syngrps[i].members) {
-            printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups");
-            goto cleanup_members;
-        }
+        memset(theaterq_syngrps[i].members, 0, syngrps_members * sizeof(struct theaterq_sched_data *));
     }
 
     return register_qdisc(&theaterq_qdisc_ops);
-
-cleanup_members:
-    while (--i >= 0) {
-        kfree(theaterq_syngrps[i].members);
-    }
-
-    kfree(theaterq_syngrps);
-    theaterq_syngrps = NULL;
-    return -ENOMEM;
 }
 
 static void __exit sch_theaterq_exit(void)
@@ -1162,13 +1215,9 @@ static void __exit sch_theaterq_exit(void)
     }
 
     if (theaterq_syngrps) {
-        for (int i = 0; i < syngrps; i++) {
-            kfree(theaterq_syngrps[i].members);
-        }
+        kfree(theaterq_syngrps);
+        theaterq_syngrps = NULL;
     }
-
-    kfree(theaterq_syngrps);
-    theaterq_syngrps = NULL;
 
     unregister_qdisc(&theaterq_qdisc_ops);
 }
