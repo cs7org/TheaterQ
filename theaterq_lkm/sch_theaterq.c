@@ -124,55 +124,145 @@ struct theaterq_skb_cb {
 
 // SYNC GROUPS =================================================================
 
+// Forward delcarations
+static void theaterq_stop_hrtimer(struct theaterq_sched_data *, bool);
+static int theaterq_run_hrtimer(struct theaterq_sched_data *, bool);
+
 static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q)
 {
-    /*
-        Called when:
-        - Any member is stopped (LOAD, CLEAR) by tc command
+    spin_lock(&theaterq_tree_lock);
 
-        Will set all members to LOAD state, when they were in ARM, RUN, FINISHED
-        Stops hrtimers when required.
-    */
+    if (!q->syngrp)
+        goto unlock;
+
+    u32 group = q->syngrp->index;
+
+    for (int i = 0; i < syngrps_members; i++) {
+        if (theaterq_syngrps[group].members[i] == NULL ||
+            theaterq_syngrps[group].members[i] == q)
+                continue;
+        
+        struct theaterq_sched_data *other = theaterq_syngrps[group].members[i];
+        if (other->stage != THEATERQ_STAGE_ARM && 
+            other->stage != THEATERQ_STAGE_RUN && 
+            other->stage != THEATERQ_STAGE_FINISH)
+                continue;
+        
+        theaterq_stop_hrtimer(other, false);
+        q->stage = THEATERQ_STAGE_LOAD;
+    }
+
+unlock:
+    spin_unlock(&theaterq_tree_lock);
 }
 
 static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
 {
-    /*
-        Called when:
-        - Any member is set to RUN by tc command
-        - A meber in ARM was triggered
+    unsigned long flags;
+    spin_lock_irqsave(&theaterq_tree_lock, flags);
 
-        Set all members to RUN and start the hrtimers
-    */
+    if (!q->syngrp)
+        goto unlock;
+
+    u32 grp = q->syngrp->index;
+
+    for (int i = 0; i < syngrps_members; i++) {
+        if (theaterq_syngrps[grp].members[i] == NULL ||
+            theaterq_syngrps[grp].members[i] == q)
+                continue;
+        
+        struct theaterq_sched_data *other = theaterq_syngrps[grp].members[i];
+        if (other->stage != THEATERQ_STAGE_LOAD && 
+            other->stage != THEATERQ_STAGE_FINISH)
+                continue;
+        
+        int errno = theaterq_run_hrtimer(other, false);
+        if (errno)
+            printk(KERN_WARNING "theaterq: Unable to start member %d in "
+                                "syngroup %d: %d\n", i, grp, errno);
+
+        q->stage = THEATERQ_STAGE_LOAD;
+    }
+
+unlock:
+    spin_unlock_irqrestore(&theaterq_tree_lock, flags);
 }
 
-static void theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 group)
+static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
 {
-    /*
-        Called when:
-        - Via tc command: syncgroup was 0 and is now != 0.
+    if (grp == -1)
+        return true;
 
-        All members (including myself) must be in LOAD or FINISHED state.
-        (Cannot join an armed/running syncgroup)
+    if (grp < -1) {
+        printk(KERN_WARNING "theaterq: Invalid syncgroup: Must be -1 or "
+                            "positive.\n");
+        return false;
+    }
 
-    */
+    if (grp >= syngrps) {
+        printk(KERN_WARNING "theaterq: Maximum syncgroup index is %d\n", 
+               syngrps - 1);
+        return false;
+    }
+
+    spin_lock(&theaterq_tree_lock);
+
+    int free_index = -1;
+
+    for (int i = 0; i < syngrps_members; i++) {
+        if (theaterq_syngrps[grp].members[i] == NULL) {
+            if (free_index == -1)
+                free_index = i;
+        } else {
+            u32 otherstage = theaterq_syngrps[grp].members[i]->stage;
+            if (otherstage != THEATERQ_STAGE_LOAD && otherstage != THEATERQ_STAGE_FINISH) {
+                printk(KERN_WARNING "theaterq: Cannot join a syncgroup with "
+                                    "running/armed members\n");
+                goto fail_unlock;
+            }
+        }
+    }
+
+    if (free_index == -1) {
+        printk(KERN_WARNING "theaterq: Selected syncgroup is full.\n");
+        goto fail_unlock;
+    }
+
+    theaterq_syngrps[grp].members[free_index] = q;
+    q->syngrp = &theaterq_syngrps[grp];
+    spin_unlock(&theaterq_tree_lock);
+    return true;
+
+fail_unlock:
+    spin_unlock(&theaterq_tree_lock);
+    return false;
 }
 
 static void theaterq_syncgroup_leave(struct theaterq_sched_data *q)
 {
-    /*
-        Called when:
-        - Via tc command: syncgroup_old != syncgroup_new
+   spin_lock(&theaterq_tree_lock);
 
-        Leave will always be possible. Sets the own syncgroup also to NULL.
-    */
+   if (!q->syngrp)
+        goto unlock;
+    
+    for (int i = 0; i < syngrps_members; i++) {
+        if (theaterq_syngrps[q->syngrp->index].members[i] == q) {
+            theaterq_syngrps[q->syngrp->index].members[i] = NULL;
+            break;
+        }
+    }
+
+    q->syngrp = NULL;
+
+unlock:
+    spin_unlock(&theaterq_tree_lock);
 }
 
-static void theaterq_syncgroup_change(struct theaterq_sched_data *q, s32 group)
+static inline bool theaterq_syncgroup_change(struct theaterq_sched_data *q, 
+                                             s32 grp)
 {
-    /*
-        Checks join/leave
-    */
+    theaterq_syncgroup_leave(q);
+    return theaterq_syncgroup_join(q, grp);
 }
 
 static inline struct theaterq_skb_cb *theaterq_skb_cb(struct sk_buff *skb)
@@ -289,9 +379,11 @@ static void theaterq_stats_clear(struct tc_theaterq_xstats *stats)
     stats->total_entries = 0;
 }
 
-static int theaterq_run_hrtimer(struct theaterq_sched_data *q, bool group_members)
+static int theaterq_run_hrtimer(struct theaterq_sched_data *q, 
+                                bool group_members)
 {
     int ret = 0;
+    unsigned long flags;
 
     if (group_members)
         theaterq_syncgroup_startall(q);
@@ -299,8 +391,14 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q, bool group_member
     if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_STOPPED, 
                        THEATERQ_HRTIMER_RUNNING))
         return ret;
-
-    q->stage = THEATERQ_STAGE_RUN;
+    
+    if (!group_members) {
+        spin_lock_irqsave(&theaterq_tree_lock, flags);
+        q->stage = THEATERQ_STAGE_RUN;
+        spin_unlock_irqrestore(&theaterq_tree_lock, flags);
+    } else {
+        q->stage = THEATERQ_STAGE_RUN;
+    }
     q->t_started = ktime_get_ns();
 
     if (!q->e_head) {
@@ -331,7 +429,8 @@ fail_reset:
     return ret;
 }
 
-static void theaterq_stop_hrtimer(struct theaterq_sched_data *q, bool group_members)
+static void theaterq_stop_hrtimer(struct theaterq_sched_data *q, 
+                                  bool group_members)
 {
     if (group_members)
         theaterq_syncgroup_stopall(q);
@@ -458,7 +557,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
 
                 if (p && *p != '\0') {
                     printk(KERN_WARNING 
-                           "sch_theaterq: Unable to parse line: Unexpected input at entry %llu!\n",
+                           "sch_theaterq: Unable to parse line: Unexpected "
+                           "input at entry %llu!\n",
                            q->e_entries + 1);
                     return -EINVAL;
                 }
@@ -929,8 +1029,12 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     if (tb[TCA_THEATERQ_PKT_OVERHEAD])
         q->packet_overhead = nla_get_u32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
 
-    if (tb[TCA_THEATERQ_SYNCGRP])
-         theaterq_syncgroup_change(q, nla_get_s32(tb[TCA_THEATERQ_SYNCGRP]));
+    if (tb[TCA_THEATERQ_SYNCGRP]) {
+        if (!theaterq_syncgroup_change(q, nla_get_s32(tb[TCA_THEATERQ_SYNCGRP]))) {
+            ret = -EBADE;
+            goto err_out;
+        }
+    }
 
     if (tb[TCA_THEATERQ_PRNG_SEED]) {
         q->prng.seed = nla_get_u64(tb[TCA_THEATERQ_PRNG_SEED]);
@@ -947,8 +1051,11 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     if (tb[TCA_THEATERQ_ALLOW_GSO])
         q->allow_gso = true;
 
-    if (new_stage != THEATERQ_STAGE_UNSPEC)
+    if (new_stage != THEATERQ_STAGE_UNSPEC) {
+        spin_lock(&theaterq_tree_lock);
         q->stage = new_stage;
+        spin_unlock(&theaterq_tree_lock);
+    }
 
     sch_tree_unlock(sch);
 
@@ -1185,23 +1292,24 @@ static int __init sch_theaterq_init(void)
                                        0, SLAB_HWCACHE_ALIGN, NULL);
     
     if (!theaterq_cache) {
-        printk(KERN_ERR "theaterq: Unable to create slab allocator");
+        printk(KERN_ERR "theaterq: Unable to create slab allocator\n");
         return -ENOMEM;
     }
 
-    theaterq_syngrps = kmalloc_array(((u32) syngrps) + 1, 
-                                     sizeof(struct theaterq_syngrp) + syngrps_members * sizeof(struct theaterq_sched_data *), 
-                                     GFP_KERNEL);
+    size_t slen = sizeof(struct theaterq_syngrp) + 
+                  syngrps_members * sizeof(struct theaterq_sched_data *);
+    theaterq_syngrps = kmalloc_array(((u32) syngrps) + 1, slen, GFP_KERNEL);
 
     if (!theaterq_syngrps) {
-        printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups");
+        printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups\n");
         kmem_cache_destroy(theaterq_cache);
         return -ENOMEM;
     }
 
     for (s32 i = 0; i < syngrps; i++) {
         theaterq_syngrps[i].index = i;
-        memset(theaterq_syngrps[i].members, 0, syngrps_members * sizeof(struct theaterq_sched_data *));
+        memset(theaterq_syngrps[i].members, 0, 
+               syngrps_members * sizeof(struct theaterq_sched_data *));
     }
 
     return register_qdisc(&theaterq_qdisc_ops);
