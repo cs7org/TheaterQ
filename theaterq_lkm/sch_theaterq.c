@@ -25,13 +25,12 @@
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
 // TODO
-// - Lock for chardev (check)
-// - Synccheck in hrtimer
 // - Duplication
 
 // DATA + HELPER FUNCTIONS =====================================================
 
 #define THEATERQ_INGEST_MAXLEN 256
+#define THEATERQ_NO_SYNCGRP_SELECTED -2
 
 static struct kmem_cache *theaterq_cache = NULL;
 static DEFINE_SPINLOCK(theaterq_tree_lock);
@@ -533,7 +532,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
 
                 /* Input format:
                  * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT\n
-                 *  ns     ns      ns   bps   a)    b)
+                 *  µs     ns      ns   bps   a)    b)
                  * 
                  * a) Scaled u32: 0 = 0%, U32_MAX = 100%, kernel does not 
                  *  support floating point numbers
@@ -594,7 +593,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     return -ENOMEM;
                 }
 
-                entry->delay = delay; 
+                entry->delay = delay * 1000; // µs -> ns 
                 entry->latency = latency;
                 entry->jitter = jitter;
                 entry->rate = rate / 8; // bits per second -> byte per second
@@ -708,7 +707,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
 {
     struct theaterq_sched_data *q = container_of(timer, 
                                         struct theaterq_sched_data, timer);
-    u64 next_delay;
+    s64 next_delay;
 
     if (atomic_read(&q->t_running) != THEATERQ_HRTIMER_RUNNING)
         return HRTIMER_NORESTART;
@@ -748,10 +747,18 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
     else
         next_delay = q->current_entry->delay;
 
-    q->stats.total_time += next_delay;
-    q->stats.total_entries++;
+    u64 t_should = q->t_started + q->stats.total_time;
+    u64 now = ktime_get_ns();
+    if (t_should < now && printk_ratelimit()) {
+        printk(KERN_WARNING "theaterq: hrtimer is lagging behind, "
+               "%lldns\n", (now - t_should));
+        q->stats.total_time += now - t_should;
+    }
 
-    hrtimer_forward(timer, ktime_set(0, q->t_started + q->stats.total_time), next_delay);
+    q->stats.total_entries++;
+    q->stats.total_time += (u64) next_delay;
+
+    hrtimer_forward_now(timer, ktime_set(0, (u64) next_delay));
     return HRTIMER_RESTART;
 }
 

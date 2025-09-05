@@ -26,7 +26,7 @@ TheaterQ expects the following Trace File line format:
 ```
 <DELAY>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>\n
 ```
-- **`DELAY`**: Delay after which this line is activated in ns. The first entry must have a delay of 0.
+- **`DELAY`**: Delay after which this line is activated in µs. The first entry must have a delay of 0.
 - **`LATENCY`** and **`JITTER`**: Packet delay latency in ns.
 - **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`).
