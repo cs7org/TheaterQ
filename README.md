@@ -57,7 +57,7 @@ TheaterQ is used in the following way:
    ```
    - `stage ARM` will start the playback when the first packet is transmitted. `stage RUN` will start the playback immediately.
    - `cont LOOP` will restart at the beginning of the Trace File after the end was reached, `cont HOLD` will hold the last values of the Trace File, and `cont CLEAR` will reset the qdisc to transparent operation.
-   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length.  The `allow_gso` flag disables automatic GSO packet segmentation.
+   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length, `pktqlen` will switch it back to packets (default: packets).  The `allow_gso`/`prevent_gso` flag disables/enables automatic GSO packet segmentation (default: disabled).
 4. By using 
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage LOAD
@@ -67,6 +67,17 @@ TheaterQ is used in the following way:
    tc qdisc change dev <oif> root handle <major> theaterq stage CLEAR
    ```
    In both cases the Trace File Replay is stopped.
+
+### Syncgroups
+Multiple TheaterQ qdisc instances can be added to syncgroups, e.g. to sync the Trace File replay between a forward and return link. Use the following workflow:
+1. Create both qdiscs on different interfaces but add the `syncgroup <group>` option. All qdiscs with the same syncgroup number will be started synchronously. With default settings, 8 syncgroups are available (0-7), while each group can have up to 8 members. To add a syncgroup, they have to be in stage `LOAD`, `ARM` or `FINISH`.
+2. Load the Trace Files. Note: Trace files can have different entries and lengths, just the start point is synchronized between the groups.
+3. Setting one qdisc to the `RUN` stage will set all the other to `RUN`, whenever possible (e.g. a Trace File was ingested and they are in a suitable stage).
+It is also possible to set one or more qdiscs to the `ARM` stage; in this case, the first received packet on any qdisc in this stage and group will set all members and itself to `RUN`.
+4. Setting one qdisc of a group to stage `LOAD` or `CLEAR` will set all other members to `LOAD` and stop the Trace File replay.
+5. Pass to `syncgroup -1` to a qdisc to leave the current syncgroup.
+
+By default, 8 syncgroups with 8 members each are available. Up to 256 syncgroups with 256 members each can be configured with the kernel modules parameters `insmod theaterq syngrps=<x> syngrps_members=<y>`.
 
 ## Debugging and Statistics
 
