@@ -34,8 +34,8 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __s32 pkt_overhead = 0;
     __u64 seed = 0;
     __s32 syncgroup = -1;
-    bool use_byteq = false; 
-    bool allow_gso = false;
+    __u8 use_byteq = 0; 
+    __u8 allow_gso = 0;
     bool has_seed = false;
     bool has_syncgroup = false;
     struct rtattr *tail;
@@ -69,10 +69,10 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 explain();
                 return -1;
             }
-        } else if (matches(*argv, "byteqlen")) {
-            use_byteq = true; 
-        } else if (matches(*argv, "allow_gso")) {
-            allow_gso = true;
+        } else if (matches(*argv, "byteqlen") == 0) {
+            use_byteq = 1; 
+        } else if (matches(*argv, "allow_gso") == 0) {
+            allow_gso = 1;
         } else if (matches(*argv, "seed") == 0) {
             NEXT_ARG();
             has_seed = true;
@@ -111,28 +111,30 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
         }
     }
 
-    tail = addattr_nest(n, 1024, TCA_OPTIONS | NLA_F_NESTED);
+    tail = addattr_nest(n, 2048, TCA_OPTIONS | NLA_F_NESTED);
     if (stage && 
-        addattr_l(n, 1024, TCA_THEATERQ_STAGE, &stage, sizeof(stage)) < 0)
+        addattr_l(n, 2048, TCA_THEATERQ_STAGE, &stage, sizeof(__u64)) < 0)
             return -1;
     if (cont && 
-        addattr_l(n, 1024, TCA_THEATERQ_CONT_MODE, &cont, sizeof(cont)) < 0)
+        addattr_l(n, 2048, TCA_THEATERQ_CONT_MODE, &cont, sizeof(__u64)) < 0)
             return -1;
     if (has_seed && 
-        addattr_l(n, 1024, TCA_THEATERQ_PRNG_SEED, &seed, sizeof(seed)) < 0)
+        addattr_l(n, 2048, TCA_THEATERQ_PRNG_SEED, &seed, sizeof(__u64)) < 0)
             return -1;
     if (pkt_overhead && 
-        addattr_l(n, 1024, TCA_THEATERQ_PKT_OVERHEAD, &pkt_overhead, sizeof(pkt_overhead)) < 0)
+        addattr_l(n, 2048, TCA_THEATERQ_PKT_OVERHEAD, &pkt_overhead, sizeof(__u64)) < 0)
             return -1;
     if (has_syncgroup && 
-        addattr_l(n, 1024, TCA_THEATERQ_SYNCGRP, &syncgroup, sizeof(syncgroup)) < 0)
+        addattr_l(n, 2048, TCA_THEATERQ_SYNCGRP, &syncgroup, sizeof(__u64)) < 0)
             return -1;
-    if (use_byteq && addattr_l(n, 1024, TCA_THEATERQ_USE_BYTEQ, &use_byteq, sizeof(use_byteq)) < 0)
+    if (use_byteq && 
+        addattr_l(n, 2048, TCA_THEATERQ_USE_BYTEQ, &use_byteq, sizeof(__u64)) < 0)
             return -1;
-    if (allow_gso && addattr_l(n, 1024, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(allow_gso)) < 0)
+    if (allow_gso &&
+        addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(__u64)) < 0)
             return -1;
-    addattr_nest_end(n, tail);
 
+    addattr_nest_end(n, tail);
     return 0;
 }
 
@@ -141,8 +143,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
 {
     __u32 stage = THEATERQ_STAGE_UNSPEC;
     __u64 seed = 0;
-    __s32 pkt_overhead = 0;
-    __s32 syncgroup = -1;
+    __u32 pkt_overhead = 0;
+    __u32 syncgroup = -1;
     __u32 cont = THEATERQ_CONT_UNSPEC;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
@@ -163,7 +165,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     if (tb[TCA_THEATERQ_STAGE]) {
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_STAGE]) < sizeof(stage))
             return -1;
-        stage = rta_getattr_u32(tb[TCA_THEATERQ_STAGE]);
+        stage = (__s32) rta_getattr_u64(tb[TCA_THEATERQ_STAGE]);
         present[TCA_THEATERQ_STAGE]++;
     }
     
@@ -177,7 +179,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     if (tb[TCA_THEATERQ_PKT_OVERHEAD]) {
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_PKT_OVERHEAD]) < sizeof(pkt_overhead))
             return -1;
-        pkt_overhead = rta_getattr_s32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
+        pkt_overhead = (__s32) rta_getattr_u64(tb[TCA_THEATERQ_PKT_OVERHEAD]);
         present[TCA_THEATERQ_PKT_OVERHEAD]++;
     }
 
@@ -185,14 +187,14 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_SYNCGRP]) < sizeof(syncgroup))
             return -1;
 
-        syncgroup = rta_getattr_s32(tb[TCA_THEATERQ_SYNCGRP]);
+        syncgroup = (__s32) rta_getattr_u64(tb[TCA_THEATERQ_SYNCGRP]);
         present[TCA_THEATERQ_SYNCGRP]++;
     }
 
     if (tb[TCA_THEATERQ_CONT_MODE]) {
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_CONT_MODE]) < sizeof(cont))
             return -1;
-        cont = rta_getattr_u32(tb[TCA_THEATERQ_CONT_MODE]);
+        cont = (__u32) rta_getattr_u64(tb[TCA_THEATERQ_CONT_MODE]);
         present[TCA_THEATERQ_CONT_MODE]++;
     }
 

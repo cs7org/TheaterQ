@@ -130,7 +130,8 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *, bool);
 
 static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q)
 {
-    spin_lock(&theaterq_tree_lock);
+    unsigned long flags;
+    spin_lock_irqsave(&theaterq_tree_lock, flags);
 
     if (!q->syngrp)
         goto unlock;
@@ -153,7 +154,7 @@ static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q)
     }
 
 unlock:
-    spin_unlock(&theaterq_tree_lock);
+    spin_unlock_irqrestore(&theaterq_tree_lock, flags);
 }
 
 static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
@@ -205,7 +206,8 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
         return false;
     }
 
-    spin_lock(&theaterq_tree_lock);
+    unsigned long flags;
+    spin_lock_irqsave(&theaterq_tree_lock, flags);
 
     int free_index = -1;
 
@@ -230,19 +232,20 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
 
     theaterq_syngrps[grp].members[free_index] = q;
     q->syngrp = &theaterq_syngrps[grp];
-    spin_unlock(&theaterq_tree_lock);
+    spin_unlock_irqrestore(&theaterq_tree_lock, flags);
     return true;
 
 fail_unlock:
-    spin_unlock(&theaterq_tree_lock);
+    spin_unlock_irqrestore(&theaterq_tree_lock, flags);
     return false;
 }
 
 static void theaterq_syncgroup_leave(struct theaterq_sched_data *q)
 {
-   spin_lock(&theaterq_tree_lock);
+    unsigned long flags;
+    spin_lock_irqsave(&theaterq_tree_lock, flags);
 
-   if (!q->syngrp)
+    if (!q->syngrp)
         goto unlock;
     
     for (int i = 0; i < syngrps_members; i++) {
@@ -255,7 +258,7 @@ static void theaterq_syncgroup_leave(struct theaterq_sched_data *q)
     q->syngrp = NULL;
 
 unlock:
-    spin_unlock(&theaterq_tree_lock);
+    spin_unlock_irqrestore(&theaterq_tree_lock, flags);
 }
 
 static inline bool theaterq_syncgroup_change(struct theaterq_sched_data *q, 
@@ -683,7 +686,8 @@ static int destroy_ingest_cdev(struct Qdisc *sch)
 
     if (!q->ingest_cdev.en)
         return 0;
-    
+
+    device_destroy(q->ingest_cdev.cls, q->ingest_cdev.dev);
     class_destroy(q->ingest_cdev.cls);
     cdev_del(&q->ingest_cdev.cdev);
     unregister_chrdev_region(q->ingest_cdev.dev, 1);
@@ -976,13 +980,13 @@ deliver:
 }
 
 static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
-    [TCA_THEATERQ_STAGE] = { .type = NLA_U32 },
+    [TCA_THEATERQ_STAGE] = { .type = NLA_U64 },
     [TCA_THEATERQ_PRNG_SEED] = { .type = NLA_U64 },
-    [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
-    [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
-    [TCA_THEATERQ_USE_BYTEQ] = { .type = NLA_FLAG },
-    [TCA_THEATERQ_ALLOW_GSO] = { .type = NLA_FLAG },
-    [TCA_THEATERQ_SYNCGRP] = { .type = NLA_S32 },
+    [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_U64 },
+    [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U64 },
+    [TCA_THEATERQ_SYNCGRP] = { .type = NLA_U64 },
+    [TCA_THEATERQ_USE_BYTEQ] = { .type = NLA_U64 },
+    [TCA_THEATERQ_ALLOW_GSO] = { .type = NLA_U64 },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -993,13 +997,17 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     int run_hrtimer = 0;
     int ret;
     u32 new_stage = THEATERQ_STAGE_UNSPEC;
+    s32 new_syncgrp = THEATERQ_NO_SYNCGRP_SELECTED;
 
-    ret = nla_parse_nested(tb, TCA_THEATERQ_MAX, opt, theaterq_policy, extack);
-    if (ret < 0) return ret;
+    ret = nla_parse_nested(tb, TCA_THEATERQ_MAX, opt, 
+                    theaterq_policy, extack);
+    if (ret < 0) {
+        return ret;
+    }
 
     sch_tree_lock(sch);
     if (tb[TCA_THEATERQ_STAGE]) {
-        new_stage = nla_get_u32(tb[TCA_THEATERQ_STAGE]);
+        new_stage = (u32) nla_get_u64(tb[TCA_THEATERQ_STAGE]);
 
         if (new_stage == THEATERQ_STAGE_FINISH)
             new_stage = THEATERQ_STAGE_LOAD;
@@ -1024,16 +1032,13 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     }
 
     if (tb[TCA_THEATERQ_CONT_MODE])
-        q->cont_mode = nla_get_u32(tb[TCA_THEATERQ_CONT_MODE]);
+        q->cont_mode = (u32) nla_get_u64(tb[TCA_THEATERQ_CONT_MODE]);
 
     if (tb[TCA_THEATERQ_PKT_OVERHEAD])
-        q->packet_overhead = nla_get_u32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
+        q->packet_overhead = (s32) nla_get_u64(tb[TCA_THEATERQ_PKT_OVERHEAD]);
 
     if (tb[TCA_THEATERQ_SYNCGRP]) {
-        if (!theaterq_syncgroup_change(q, nla_get_s32(tb[TCA_THEATERQ_SYNCGRP]))) {
-            ret = -EBADE;
-            goto err_out;
-        }
+        new_syncgrp = (s32) nla_get_u64(tb[TCA_THEATERQ_SYNCGRP]);
     }
 
     if (tb[TCA_THEATERQ_PRNG_SEED]) {
@@ -1046,18 +1051,23 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
     prandom_seed_state(&q->prng.prng_state, q->prng.seed);
 
     if (tb[TCA_THEATERQ_USE_BYTEQ])
-        q->use_byte_queue = true;
+        q->use_byte_queue = nla_get_u64(tb[TCA_THEATERQ_USE_BYTEQ]) != 0;
 
     if (tb[TCA_THEATERQ_ALLOW_GSO])
-        q->allow_gso = true;
-
-    if (new_stage != THEATERQ_STAGE_UNSPEC) {
-        spin_lock(&theaterq_tree_lock);
-        q->stage = new_stage;
-        spin_unlock(&theaterq_tree_lock);
-    }
+        q->allow_gso = nla_get_u64(tb[TCA_THEATERQ_ALLOW_GSO]) != 0;
 
     sch_tree_unlock(sch);
+
+    if (new_stage != THEATERQ_STAGE_UNSPEC) {
+        unsigned long flags;
+        spin_lock_irqsave(&theaterq_tree_lock, flags);
+        q->stage = new_stage;
+        spin_unlock_irqrestore(&theaterq_tree_lock, flags);
+    }
+
+    if (new_syncgrp != THEATERQ_NO_SYNCGRP_SELECTED 
+        && !theaterq_syncgroup_change(q, new_syncgrp))
+            return -EBADE;
 
     if (run_hrtimer)
         ret = theaterq_run_hrtimer(q, true);
@@ -1137,21 +1147,21 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
     if (!opts)
         return -EMSGSIZE;
 
-    if (nla_put_u32(skb, TCA_THEATERQ_STAGE, q->stage))
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_STAGE, q->stage, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
     if (q->prng.seed_set && nla_put_u64_64bit(skb, TCA_THEATERQ_PRNG_SEED, 
                                               q->prng.seed, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
-    if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead, TCA_THEATERQ_PAD))
         goto nla_put_failure;
     
-    s16 syncgroup = q->syngrp == NULL ? -1 : q->syngrp->index;
-    if (nla_put_s16(skb, TCA_THEATERQ_SYNCGRP, syncgroup))
+    s32 syncgroup = q->syngrp == NULL ? -1 : q->syngrp->index;
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_SYNCGRP, syncgroup, TCA_THEATERQ_PAD))
         goto nla_put_failure;
     
-    if (nla_put_u32(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode))
+    if (nla_put_u64_64bit(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode, TCA_THEATERQ_PAD))
         goto nla_put_failure;
     
     if (nla_put(skb, TCA_THEATERQ_INGEST_CDEV, 
@@ -1166,7 +1176,8 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
                           q->e_current, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
-     if (q->use_byte_queue && nla_put_flag(skb, TCA_THEATERQ_USE_BYTEQ))
+     if (q->use_byte_queue && nla_put_u64_64bit(skb, TCA_THEATERQ_USE_BYTEQ,
+                                         q->use_byte_queue, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
     if (q->current_entry) {
@@ -1178,7 +1189,8 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
             goto nla_put_failure;
     }
 
-    if (q->allow_gso && nla_put_flag(skb, TCA_THEATERQ_ALLOW_GSO))
+    if (q->allow_gso && nla_put_u64_64bit(skb, TCA_THEATERQ_ALLOW_GSO,
+                                   q->allow_gso, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
     return nla_nest_end(skb, opts);
