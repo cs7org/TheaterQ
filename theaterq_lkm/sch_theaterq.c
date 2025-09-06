@@ -24,6 +24,10 @@
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
+// TODO Area:
+// - Fix start delay offset
+// - Use tbf in dequeue
+
 // DATA + HELPER FUNCTIONS =====================================================
 
 #define THEATERQ_INGEST_MAXLEN 256
@@ -804,14 +808,10 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     s64 delay = 0;
     u64 check_len;
 
-    if (current_entry) {
+    if (current_entry)
         delay = get_pkt_delay(current_entry->latency, 
                               current_entry->jitter,
                               &q->prng);
-
-        if (q->isdup)
-            delay += current_entry->dup_delay;
-    }
     skb->prev = NULL;
 
     if (loss_event(q)) {
@@ -833,6 +833,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             q->isdup = true;
             rootq->enqueue(dup_skb, rootq, to_free);
             q->isdup = false;
+            delay += current_entry->dup_delay;
     }
 
     check_len = q->use_byte_queue ? 
@@ -988,7 +989,6 @@ deliver:
             skb->dev = qdisc_dev(sch);
 
             if (q->qdisc) {
-                
                 struct sk_buff *to_free = NULL;
                 int err;
 
