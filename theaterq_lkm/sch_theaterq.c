@@ -75,6 +75,8 @@ struct theaterq_sched_data {
         struct rnd_state prng_state;
     } prng;
 
+    bool isdup;
+
     s32 packet_overhead;
     u32 stage;
     u32 cont_mode;
@@ -787,7 +789,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
 }
 
 static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
-                                struct sk_buff **to_free, bool dup)
+                                struct sk_buff **to_free)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct theaterq_skb_cb *cb;
@@ -801,14 +803,13 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     s64 now = ktime_get_ns();
     s64 delay = 0;
     u64 check_len;
-    bool orphaned = false;
 
     if (current_entry) {
         delay = get_pkt_delay(current_entry->latency, 
                               current_entry->jitter,
                               &q->prng);
 
-        if (dup)
+        if (q->isdup)
             delay += current_entry->dup_delay;
     }
     skb->prev = NULL;
@@ -819,18 +820,19 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
-    if (current_entry && !dup && 
-        (current_entry->latency ||
-         current_entry->jitter ||
-         current_entry->rate)) {
+    if (current_entry && (current_entry->latency || 
+        current_entry->jitter || current_entry->rate || 
+        (q->isdup && current_entry->dup_delay)))
             skb_orphan_partial(skb);
-            orphaned = true;
-    }
 
-    if (!dup && dup_event(q) && (dup_skb == skb_clone(skb, GFP_ATOMIC))) {
-        if (!orphaned && (current_entry && current_entry->dup_delay))
-            skb_orphan_partial(dup_skb);
-        (void) theaterq_enqueue_seg(dup_skb, sch, to_free, true);
+    if (!q->isdup && dup_event(q) && 
+        (dup_skb = skb_clone(skb, GFP_ATOMIC)) != NULL) {
+            struct Qdisc *rootq = qdisc_root_bh(sch);
+
+            // Don't duplicate again
+            q->isdup = true;
+            rootq->enqueue(dup_skb, rootq, to_free);
+            q->isdup = false;
     }
 
     check_len = q->use_byte_queue ? 
@@ -898,7 +900,7 @@ static int theaterq_enqueue_gso(struct sk_buff *skb, struct Qdisc *sch,
         skb_mark_not_on_list(segs);
         qdisc_skb_cb(segs)->pkt_len = segs->len;
 
-        ret = theaterq_enqueue_seg(segs, sch, to_free, false); 
+        ret = theaterq_enqueue_seg(segs, sch, to_free); 
         if ((ret & ~__NET_XMIT_BYPASS) == NET_XMIT_SUCCESS) {
             if ((ret & __NET_XMIT_BYPASS) != 0) {
                 flag = __NET_XMIT_BYPASS;
@@ -926,7 +928,7 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     if (skb_is_gso(skb) && !q->allow_gso)
         return theaterq_enqueue_gso(skb, sch, to_free);
     else
-        return theaterq_enqueue_seg(skb, sch, to_free, false);
+        return theaterq_enqueue_seg(skb, sch, to_free);
 }
 
 static struct sk_buff *theaterq_peek(struct theaterq_sched_data *q)
@@ -1143,6 +1145,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->ingest_mode = THEATERQ_INGEST_MODE_SIMPLE;
     q->allow_gso = false;
     q->syngrp = NULL;
+    q->isdup = false;
 
     qdisc_watchdog_init(&q->watchdog, sch);
 
@@ -1343,7 +1346,7 @@ static struct Qdisc_ops theaterq_qdisc_ops __read_mostly = {
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
 MODULE_DESCRIPTION("Trace File based Link Emulator");
-MODULE_VERSION("0.1");
+MODULE_VERSION("1.0");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
 MODULE_ALIAS_NET_SCH("theaterq");
