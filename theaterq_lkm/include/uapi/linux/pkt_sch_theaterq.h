@@ -5,6 +5,7 @@
 
 #define THEATERQ_CDEV_MAX_NAMELEN 64
 #define THEATERQ_CDEV_PREFIX "/dev/"
+#define THEATERQ_SYNCGROUP_LEAVE -1
 
 enum {
     THEATERQ_STAGE_UNSPEC,
@@ -27,6 +28,14 @@ enum {
 #define THEATERQ_CONT_MAX (__THEATERQ_CONT_MAX - 1)
 
 enum {
+    THEATERQ_INGEST_MODE_UNSPEC,
+    THEATERQ_INGEST_MODE_SIMPLE,
+    THEATERQ_INGEST_MODE_EXTENDED,
+    __THEATERQ_INGEST_MODE_MAX,
+};
+#define THEATERQ_INGEST_MODE_MAX (__THEATERQ_INGEST_MODE_MAX - 1)
+
+enum {
     TCA_THEATERQ_UNSPEC,
     TCA_THEATERQ_PAD,
     TCA_THEATERQ_STAGE,
@@ -36,6 +45,7 @@ enum {
     TCA_THEATERQ_SYNCGRP,
     TCA_THEATERQ_USE_BYTEQ,
     TCA_THEATERQ_ALLOW_GSO,
+    TCA_THEATERQ_INGEST_MODE,
     TCA_THEATERQ_INGEST_CDEV,
     TCA_THEATERQ_ENTRY_LEN,
     TCA_THEATERQ_ENTRY_POS,
@@ -51,6 +61,8 @@ struct theaterq_entry {
     __u64 rate;
     __u32 loss;
     __u32 limit;
+    __u32 dup_prob;
+    __u32 dup_delay;
     struct theaterq_entry *next;
 };
 

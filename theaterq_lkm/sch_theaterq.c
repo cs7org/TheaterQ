@@ -24,9 +24,6 @@
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
-// TODO
-// - Duplication
-
 // DATA + HELPER FUNCTIONS =====================================================
 
 #define THEATERQ_INGEST_MAXLEN 256
@@ -43,6 +40,8 @@ static const struct theaterq_entry theaterq_default_entry = {
     .rate = 0ULL,
     .loss = 0UL,
     .limit = 1000UL,
+    .dup_prob = 0UL,
+    .dup_delay = 0UL,
     .next = NULL,
 };
 
@@ -79,6 +78,7 @@ struct theaterq_sched_data {
     s32 packet_overhead;
     u32 stage;
     u32 cont_mode;
+    u32 ingest_mode;
     bool use_byte_queue;
     bool allow_gso;
     struct theaterq_entry *current_entry;
@@ -197,12 +197,12 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
 
 static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
 {
-    if (grp == -1)
+    if (grp == THEATERQ_SYNCGROUP_LEAVE)
         return true;
 
-    if (grp < -1) {
-        printk(KERN_WARNING "theaterq: Invalid syncgroup: Must be -1 or "
-                            "positive.\n");
+    if (grp < THEATERQ_SYNCGROUP_LEAVE) {
+        printk(KERN_WARNING "theaterq: Invalid syncgroup: Must be %d or "
+                            "positive.\n", THEATERQ_SYNCGROUP_LEAVE);
         return false;
     }
 
@@ -284,6 +284,14 @@ static inline bool loss_event(struct theaterq_sched_data *q)
 
     return q->current_entry->loss && 
            q->current_entry->loss >= prandom_u32_state(&q->prng.prng_state);
+}
+
+static inline bool dup_event(struct theaterq_sched_data *q)
+{
+    if (!READ_ONCE(q->current_entry)) return false;
+
+    return q->current_entry->dup_prob &&
+           q->current_entry->dup_prob >= prandom_u32_state(&q->prng.prng_state);
 }
 
 static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
@@ -524,15 +532,21 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
 
                 u64 delay;
                 u64 latency;
-                u64 jitter;
+                u64 jitter = 0;
                 u64 rate;
                 u32 loss;
                 u32 limit;
+                u32 dup_prob = 0;
+                u32 dup_delay = 0;
                 struct theaterq_entry *entry;
 
-                /* Input format:
-                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT\n
-                 *  µs     ns      ns   bps   a)    b)
+                /* Simple input format:
+                 * DELAY,LATENCY,RATE,LOSS,LIMIT\n
+                 *  µs     ns    bps    a)    b)
+                 * 
+                 * Extended input format:
+                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY\n
+                 *  µs     ns      ns   bps   a)    b)     a)       ns
                  * 
                  * a) Scaled u32: 0 = 0%, U32_MAX = 100%, kernel does not 
                  *  support floating point numbers
@@ -544,24 +558,32 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 int i = 0;
 
 #define PARSE_TOKEN(fun, dest) do { \
-                        token = strsep(&p, ","); \
-                        if (!token || fun(token, 10, dest)) { \
-                            printk(KERN_WARNING \
-                                  "sch_theaterq: Parsing error at pos %u in entry %llu\n", \
-                                  i, q->e_entries + 1); \
-                            q->ingest_helper.lpos = 0; \
-                            return -EINVAL; \
-                        } \
-                        i++; \
-                    } while (0)
+                    token = strsep(&p, ","); \
+                    if (!token || fun(token, 10, dest)) { \
+                        printk(KERN_WARNING \
+                              "sch_theaterq: Parsing error at pos %u in entry %llu\n", \
+                              i, q->e_entries + 1); \
+                        q->ingest_helper.lpos = 0; \
+                        return -EINVAL; \
+                    } \
+                    i++; \
+                } while (0)
+
+#define PARSE_TOKEN_EXTENDED(fun, dest) do { \
+                    if (q->ingest_mode == THEATERQ_INGEST_MODE_EXTENDED) \
+                        PARSE_TOKEN(fun, dest); \
+                } while (0)
 
                 PARSE_TOKEN(kstrtou64, &delay);
                 PARSE_TOKEN(kstrtou64, &latency);
-                PARSE_TOKEN(kstrtou64, &jitter);
+                PARSE_TOKEN_EXTENDED(kstrtou64, &jitter);
                 PARSE_TOKEN(kstrtou64, &rate);
                 PARSE_TOKEN(kstrtou32, &loss);
                 PARSE_TOKEN(kstrtou32, &limit);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &dup_prob);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &dup_delay);
 
+#undef PARSE_TOKEN_EXTENDED
 #undef PARSE_TOKEN
 
                 if (p && *p != '\0') {
@@ -600,6 +622,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 entry->loss = loss;
                 entry->limit = limit;
                 entry->next = NULL;
+                entry->dup_prob = dup_prob;
+                entry->dup_delay = dup_delay;
 
                 if (q->e_head == NULL) {
                     q->e_head = entry;
@@ -763,10 +787,11 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
 }
 
 static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
-                                struct sk_buff **to_free)
+                                struct sk_buff **to_free, bool dup)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct theaterq_skb_cb *cb;
+    struct sk_buff *dup_skb;
 
     if (READ_ONCE(q->stage) == THEATERQ_STAGE_ARM) {
         (void) theaterq_run_hrtimer(q, true);
@@ -776,11 +801,15 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     s64 now = ktime_get_ns();
     s64 delay = 0;
     u64 check_len;
+    bool orphaned = false;
 
     if (current_entry) {
         delay = get_pkt_delay(current_entry->latency, 
                               current_entry->jitter,
                               &q->prng);
+
+        if (dup)
+            delay += current_entry->dup_delay;
     }
     skb->prev = NULL;
 
@@ -790,11 +819,18 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
-    if (current_entry  && 
+    if (current_entry && !dup && 
         (current_entry->latency ||
          current_entry->jitter ||
          current_entry->rate)) {
             skb_orphan_partial(skb);
+            orphaned = true;
+    }
+
+    if (!dup && dup_event(q) && (dup_skb == skb_clone(skb, GFP_ATOMIC))) {
+        if (!orphaned && (current_entry && current_entry->dup_delay))
+            skb_orphan_partial(dup_skb);
+        (void) theaterq_enqueue_seg(dup_skb, sch, to_free, true);
     }
 
     check_len = q->use_byte_queue ? 
@@ -862,7 +898,7 @@ static int theaterq_enqueue_gso(struct sk_buff *skb, struct Qdisc *sch,
         skb_mark_not_on_list(segs);
         qdisc_skb_cb(segs)->pkt_len = segs->len;
 
-        ret = theaterq_enqueue_seg(segs, sch, to_free); 
+        ret = theaterq_enqueue_seg(segs, sch, to_free, false); 
         if ((ret & ~__NET_XMIT_BYPASS) == NET_XMIT_SUCCESS) {
             if ((ret & __NET_XMIT_BYPASS) != 0) {
                 flag = __NET_XMIT_BYPASS;
@@ -890,7 +926,7 @@ static int theaterq_enqueue(struct sk_buff *skb, struct Qdisc *sch,
     if (skb_is_gso(skb) && !q->allow_gso)
         return theaterq_enqueue_gso(skb, sch, to_free);
     else
-        return theaterq_enqueue_seg(skb, sch, to_free);
+        return theaterq_enqueue_seg(skb, sch, to_free, false);
 }
 
 static struct sk_buff *theaterq_peek(struct theaterq_sched_data *q)
@@ -994,13 +1030,14 @@ deliver:
 }
 
 static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
-    [TCA_THEATERQ_STAGE] = { .type = NLA_U32 },
-    [TCA_THEATERQ_PRNG_SEED] = { .type = NLA_U64 },
+    [TCA_THEATERQ_STAGE]        = { .type = NLA_U32 },
+    [TCA_THEATERQ_PRNG_SEED]    = { .type = NLA_U64 },
     [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
-    [TCA_THEATERQ_CONT_MODE] = { .type = NLA_U32 },
-    [TCA_THEATERQ_SYNCGRP] = { .type = NLA_S32 },
-    [TCA_THEATERQ_USE_BYTEQ] = { .type = NLA_U8 },
-    [TCA_THEATERQ_ALLOW_GSO] = { .type = NLA_U8 },
+    [TCA_THEATERQ_CONT_MODE]    = { .type = NLA_U32 },
+    [TCA_THEATERQ_INGEST_MODE]  = { .type = NLA_U32 },
+    [TCA_THEATERQ_SYNCGRP]      = { .type = NLA_S32 },
+    [TCA_THEATERQ_USE_BYTEQ]    = { .type = NLA_U8  },
+    [TCA_THEATERQ_ALLOW_GSO]    = { .type = NLA_U8  },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -1047,6 +1084,9 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 
     if (tb[TCA_THEATERQ_CONT_MODE])
         q->cont_mode = nla_get_u32(tb[TCA_THEATERQ_CONT_MODE]);
+
+    if (tb[TCA_THEATERQ_INGEST_MODE])
+        q->ingest_mode = nla_get_u32(tb[TCA_THEATERQ_INGEST_MODE]);
 
     if (tb[TCA_THEATERQ_PKT_OVERHEAD])
         q->packet_overhead = nla_get_s32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
@@ -1100,6 +1140,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
 
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
+    q->ingest_mode = THEATERQ_INGEST_MODE_SIMPLE;
     q->allow_gso = false;
     q->syngrp = NULL;
 
@@ -1169,11 +1210,14 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
     if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
         goto nla_put_failure;
     
-    s32 syncgroup = q->syngrp == NULL ? -1 : q->syngrp->index;
+    s32 syncgroup = q->syngrp == NULL ? THEATERQ_SYNCGROUP_LEAVE : q->syngrp->index;
     if (nla_put_s32(skb, TCA_THEATERQ_SYNCGRP, syncgroup))
         goto nla_put_failure;
     
     if (nla_put_u32(skb, TCA_THEATERQ_CONT_MODE, q->cont_mode))
+        goto nla_put_failure;
+
+    if (nla_put_u32(skb, TCA_THEATERQ_INGEST_MODE, q->ingest_mode))
         goto nla_put_failure;
     
     if (nla_put(skb, TCA_THEATERQ_INGEST_CDEV, 
@@ -1300,6 +1344,10 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Martin Ottens <martin.ottens@fau.de>");
 MODULE_DESCRIPTION("Trace File based Link Emulator");
 MODULE_VERSION("0.1");
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0)
+MODULE_ALIAS_NET_SCH("theaterq");
+#endif
 
 module_param(syngrps, byte, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(syngrps, 

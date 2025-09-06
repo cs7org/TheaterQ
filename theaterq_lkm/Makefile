@@ -5,7 +5,6 @@ PWD := $(shell pwd)
 
 EXTRA_CFLAGS = -I$(PWD)/include
 obj-m += sch_theaterq.o
-#sch_theaterq-y := sch_theaterq.o
 ccflags-y += -I$(PWD)/include
 
 .PHONY: clean

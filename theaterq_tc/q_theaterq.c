@@ -16,8 +16,9 @@ static void explain(void)
 {
     fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|ARM|CLEAR}]\n"
                     "                    [cont {LOOP|HOLD|CLEAR}]\n"
-                    "                    [byteqlen | pktqlen]\n"
-                    "                    [allow_gso | prevent_gso]\n"
+                    "                    [byteqlen|pktqlen]\n"
+                    "                    [allow_gso|prevent_gso]\n"
+                    "                    [ingest {SIMPLE|EXTENDED}]\n"
                     "                    [seed SEED]\n"
                     "                    [overhead PACKETOVERHEAD]\n"
                     "                    [syncgroup SYNCGROUP]\n");
@@ -33,6 +34,7 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
 {
     __u32 stage = THEATERQ_STAGE_UNSPEC;
     __u32 cont = THEATERQ_CONT_UNSPEC;
+    __u32 ingest = THEATERQ_INGEST_MODE_UNSPEC;
     __s32 pkt_overhead = 0;
     __u64 seed = 0;
     __s32 syncgroup = -1;
@@ -71,6 +73,17 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 explain();
                 return -1;
             }
+        } else if (matches(*argv, "ingest") == 0) {
+            NEXT_ARG();
+            if (strcmp(*argv, "SIMPLE") == 0) {
+                ingest = THEATERQ_INGEST_MODE_SIMPLE;
+            } else if (strcmp(*argv, "EXTENDED") == 0) {
+                ingest = THEATERQ_INGEST_MODE_EXTENDED;
+            } else {
+                fprintf(stderr, "Unsupported ingest mode \"%s\".\n", *argv);
+                explain();
+                return -1;
+            }
         } else if (matches(*argv, "byteqlen") == 0) {
             use_byteq = 1; 
         } else if (matches(*argv, "allow_gso") == 0) {
@@ -99,9 +112,9 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 return -1;
             }
 
-            if (syncgroup < -1 || syncgroup > UINT8_MAX) {
-                fprintf(stderr, "Invalid syncgroup \"%d\" (select from [-1,%d]).\n", 
-                        syncgroup, UINT8_MAX);
+            if (syncgroup < THEATERQ_SYNCGROUP_LEAVE || syncgroup > UINT8_MAX) {
+                fprintf(stderr, "Invalid syncgroup \"%d\" (select from [%d,%d]).\n", 
+                        syncgroup, THEATERQ_SYNCGROUP_LEAVE, UINT8_MAX);
                 explain();
                 return -1;
             }
@@ -123,6 +136,9 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
             return -1;
     if (cont && 
         addattr_l(n, 2048, TCA_THEATERQ_CONT_MODE, &cont, sizeof(cont)) < 0)
+            return -1;
+    if (ingest && 
+        addattr_l(n, 2048, TCA_THEATERQ_INGEST_MODE, &ingest, sizeof(ingest)) < 0)
             return -1;
     if (has_seed && 
         addattr_l(n, 2048, TCA_THEATERQ_PRNG_SEED, &seed, sizeof(seed)) < 0)
@@ -148,10 +164,11 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                               struct rtattr *opt)
 {
     __u32 stage = THEATERQ_STAGE_UNSPEC;
+    __u32 cont = THEATERQ_CONT_UNSPEC;
+    __u32 ingest = THEATERQ_INGEST_MODE_UNSPEC;
     __u64 seed = 0;
     __u32 pkt_overhead = 0;
     __u32 syncgroup = -1;
-    __u32 cont = THEATERQ_CONT_UNSPEC;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
     struct theaterq_entry *entry_current = NULL;
@@ -168,61 +185,31 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
 
     parse_rtattr_nested(tb, TCA_THEATERQ_MAX, opt);
 
-    if (tb[TCA_THEATERQ_STAGE]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_STAGE]) < sizeof(stage))
-            return -1;
-        stage = rta_getattr_s32(tb[TCA_THEATERQ_STAGE]);
-        present[TCA_THEATERQ_STAGE]++;
-    }
+#define SET_GETATTR_VALUE(destination, attr, accessor) do { \
+                    if (tb[attr]) { \
+                        if (RTA_PAYLOAD(tb[attr]) < sizeof(destination)) \
+                            return -1; \
+                        destination = accessor(tb[attr]); \
+                        present[attr]++; \
+                    } \
+                } while (0)
     
-    if (tb[TCA_THEATERQ_PRNG_SEED]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_PRNG_SEED]) < sizeof(seed))
-            return -1;
-        seed = rta_getattr_u64(tb[TCA_THEATERQ_PRNG_SEED]);
-        present[TCA_THEATERQ_PRNG_SEED]++;
-    }
+    SET_GETATTR_VALUE(stage, TCA_THEATERQ_STAGE, rta_getattr_s32);
+    SET_GETATTR_VALUE(cont, TCA_THEATERQ_CONT_MODE, rta_getattr_u32);
+    SET_GETATTR_VALUE(ingest, TCA_THEATERQ_INGEST_MODE, rta_getattr_u32);
+    SET_GETATTR_VALUE(seed, TCA_THEATERQ_PRNG_SEED, rta_getattr_u64);
+    SET_GETATTR_VALUE(pkt_overhead, TCA_THEATERQ_PKT_OVERHEAD, rta_getattr_s32);
+    SET_GETATTR_VALUE(syncgroup, TCA_THEATERQ_SYNCGRP, rta_getattr_s32);
+    SET_GETATTR_VALUE(entry_count, TCA_THEATERQ_ENTRY_LEN, rta_getattr_u64);
+    SET_GETATTR_VALUE(entry_pos, TCA_THEATERQ_ENTRY_POS, rta_getattr_u64);
 
-    if (tb[TCA_THEATERQ_PKT_OVERHEAD]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_PKT_OVERHEAD]) < sizeof(pkt_overhead))
-            return -1;
-        pkt_overhead = rta_getattr_s32(tb[TCA_THEATERQ_PKT_OVERHEAD]);
-        present[TCA_THEATERQ_PKT_OVERHEAD]++;
-    }
-
-    if (tb[TCA_THEATERQ_SYNCGRP]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_SYNCGRP]) < sizeof(syncgroup))
-            return -1;
-
-        syncgroup = rta_getattr_s32(tb[TCA_THEATERQ_SYNCGRP]);
-        present[TCA_THEATERQ_SYNCGRP]++;
-    }
-
-    if (tb[TCA_THEATERQ_CONT_MODE]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_CONT_MODE]) < sizeof(cont))
-            return -1;
-        cont = rta_getattr_u32(tb[TCA_THEATERQ_CONT_MODE]);
-        present[TCA_THEATERQ_CONT_MODE]++;
-    }
+#undef SET_GETATTR_VALUE
 
     if (tb[TCA_THEATERQ_INGEST_CDEV]) {
         if (RTA_PAYLOAD(tb[TCA_THEATERQ_INGEST_CDEV]) < sizeof(*ingest_cdev))
             return -1;
         ingest_cdev = RTA_DATA(tb[TCA_THEATERQ_INGEST_CDEV]);
         present[TCA_THEATERQ_INGEST_CDEV]++;
-    }
-
-    if (tb[TCA_THEATERQ_ENTRY_LEN]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_ENTRY_LEN]) < sizeof(entry_count))
-            return -1;
-        entry_count = rta_getattr_u64(tb[TCA_THEATERQ_ENTRY_LEN]);
-        present[TCA_THEATERQ_ENTRY_LEN]++;
-    }
-
-    if (tb[TCA_THEATERQ_ENTRY_POS]) {
-        if (RTA_PAYLOAD(tb[TCA_THEATERQ_ENTRY_POS]) < sizeof(entry_pos))
-            return -1;
-        entry_pos = rta_getattr_u64(tb[TCA_THEATERQ_ENTRY_POS]);
-        present[TCA_THEATERQ_ENTRY_POS]++;
     }
 
     if (tb[TCA_THEATERQ_ENTRY_CURRENT]) {
@@ -254,9 +241,10 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         print_s64(PRINT_ANY, "packet_overhead", 
                   " packet_overhead %d", pkt_overhead);
 
-    if (present[TCA_THEATERQ_SYNCGRP] && syncgroup != -1)
-        print_s64(PRINT_ANY, "syncgroup", 
-                 " syncgroup %d", syncgroup);
+    if (present[TCA_THEATERQ_SYNCGRP] && 
+        syncgroup != THEATERQ_SYNCGROUP_LEAVE)
+            print_s64(PRINT_ANY, "syncgroup", 
+                    " syncgroup %d", syncgroup);
 
     print_on_off(PRINT_ANY, "bytequeue", 
                  " bytequeue %s", tb[TCA_THEATERQ_USE_BYTEQ]);
@@ -274,6 +262,17 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
             cont_str = "CLEAR";
 
         print_string(PRINT_ANY, "cont_mode", " cont_mode %s", cont_str);
+    }
+
+    if (present[TCA_THEATERQ_INGEST_MODE]) {
+        char *ingest_str = "INVALID";
+
+        if (ingest == THEATERQ_INGEST_MODE_SIMPLE)
+            ingest_str = "SIMPLE";
+        else if (ingest == THEATERQ_INGEST_MODE_EXTENDED)
+            ingest_str = "EXTENDED";
+
+        print_string(PRINT_ANY, "ingest_mode", " ingest_mode %s", ingest_str);
     }
 
     if (present[TCA_THEATERQ_INGEST_CDEV]) {
@@ -309,13 +308,27 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
             tc_print_rate(PRINT_ANY, "rate", " rate %s", entry_current->rate);
         
         print_float(PRINT_JSON, "loss", NULL, 
-                        (1. * entry_current->loss) / UINT32_MAX);
+                    (1. * entry_current->loss) / UINT32_MAX);
         if (entry_current->loss)
             print_float(PRINT_FP, NULL, " loss", 
                         (100. * entry_current->loss) / UINT32_MAX);
 
         print_u64(PRINT_ANY, "limit", " limit %llu", 
                   (__u64) entry_current->limit);
+
+        if (entry_current->dup_prob != 0) {
+            if (is_json_context()) {
+                print_float(PRINT_JSON, "duplicate_probability", NULL,
+                            (1. * entry_current->dup_prob) / UINT32_MAX);
+                print_float(PRINT_JSON, "duplicate_delay", NULL,
+                            (double) entry_current->dup_delay / 1000000000.0);
+            } else {
+                print_float(PRINT_FP, NULL, " duplicate_probability",
+                            (100. * entry_current->dup_prob) / UINT32_MAX);
+                print_string(PRINT_FP, NULL, " %s",
+                            sprint_time64(entry_current->dup_delay, b1));
+            }
+        }
 
         close_json_object();
     }

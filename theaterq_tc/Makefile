@@ -11,6 +11,7 @@ all: q_theaterq.c
 	make -C $(IPR2) -j$(nproc --ignore 1) TCSO=q_theaterq.so all
 	mkdir -p $(TC_LIB)
 	cp $(IPR2_TC)/q_theaterq.so $(TC_LIB)/.
+
 clean:
 	make -C $(IPR2) clean
 	rm -vf $(IPR2_TC)/q_theaterq.c
