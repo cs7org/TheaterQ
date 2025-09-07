@@ -25,7 +25,6 @@
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
 // TODO Area:
-// - Fix start delay offset
 // - Use tbf in dequeue
 
 // DATA + HELPER FUNCTIONS =====================================================
@@ -419,7 +418,6 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q,
         q->stage = THEATERQ_STAGE_RUN;
         spin_unlock_bh(&theaterq_tree_lock);
     }
-    q->t_started = ktime_get_ns();
 
     if (!q->e_head) {
         ret = -EINVAL;
@@ -437,7 +435,8 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q,
 
     q->stats.total_time = q->current_entry->next->delay;
     q->stats.total_entries++;
-    ktime_t delay = ktime_set(0, q->stats.total_time);
+    q->t_started = ktime_get_ns();
+    ktime_t delay = ktime_set(0, q->t_started + q->stats.total_time);
 
     hrtimer_start(&q->timer, delay, HRTIMER_MODE_ABS);
     return ret;
