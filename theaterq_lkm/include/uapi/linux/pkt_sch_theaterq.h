@@ -45,6 +45,7 @@ enum {
     TCA_THEATERQ_SYNCGRP,
     TCA_THEATERQ_USE_BYTEQ,
     TCA_THEATERQ_ALLOW_GSO,
+    TCA_THEATERQ_ENABLE_ECN,
     TCA_THEATERQ_INGEST_MODE,
     TCA_THEATERQ_INGEST_CDEV,
     TCA_THEATERQ_ENTRY_LEN,
@@ -63,6 +64,7 @@ struct theaterq_entry {
     __u32 limit;
     __u32 dup_prob;
     __u32 dup_delay;
+    __u32 reorder;
     struct theaterq_entry *next;
 };
 

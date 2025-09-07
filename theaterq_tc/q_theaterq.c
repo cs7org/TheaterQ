@@ -11,6 +11,13 @@
 #include "tc_common.h"
 
 #define Q_THEATERQ_FLAG_NOT_SET 2
+#define Q_THEATER_CHECK_FLAG(var, str) do { \
+                if (var != Q_THEATERQ_FLAG_NOT_SET) { \
+                    fprintf(stderr, "Flag was already set: \"%s\".\n", str); \
+                    explain(); \
+                    return -1; \
+                } \
+            } while (0)
 
 static void explain(void)
 {
@@ -20,6 +27,7 @@ static void explain(void)
                     "                    [allow_gso|prevent_gso]\n"
                     "                    [ingest {SIMPLE|EXTENDED}]\n"
                     "                    [seed SEED]\n"
+                    "                    [ecn_enable_ecn|ecn_disable]\n"
                     "                    [overhead PACKETOVERHEAD]\n"
                     "                    [syncgroup SYNCGROUP]\n");
 }
@@ -40,6 +48,7 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __s32 syncgroup = -1;
     __u8 use_byteq = Q_THEATERQ_FLAG_NOT_SET; 
     __u8 allow_gso = Q_THEATERQ_FLAG_NOT_SET;
+    __u8 enable_ecn = Q_THEATERQ_FLAG_NOT_SET;
     bool has_seed = false;
     bool has_syncgroup = false;
     struct rtattr *tail;
@@ -85,13 +94,23 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 return -1;
             }
         } else if (matches(*argv, "byteqlen") == 0) {
-            use_byteq = 1; 
+            Q_THEATER_CHECK_FLAG(use_byteq, "Queue type");
+            use_byteq = 1;
+         } else if (matches(*argv, "pktqlen") == 0) {
+            Q_THEATER_CHECK_FLAG(use_byteq, "Queue type");
+            use_byteq = 0; 
         } else if (matches(*argv, "allow_gso") == 0) {
+            Q_THEATER_CHECK_FLAG(allow_gso, "GSO segmentation");
             allow_gso = 1;
-        } else if (matches(*argv, "pktqlen") == 0) {
-            use_byteq = 0;
         } else if (matches(*argv, "prevent_gso") == 0) {
+            Q_THEATER_CHECK_FLAG(allow_gso, "GSO segmentation");
             allow_gso = 0;
+        } else if (matches(*argv, "ecn_enable") == 0) {
+            Q_THEATER_CHECK_FLAG(enable_ecn, "ECN");
+            enable_ecn = 1;
+        } else if (matches(*argv, "ecn_disable") == 0) {
+            Q_THEATER_CHECK_FLAG(enable_ecn, "ECN");
+            enable_ecn = 0;
         } else if (matches(*argv, "seed") == 0) {
             NEXT_ARG();
             has_seed = true;
@@ -154,6 +173,9 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
             return -1;
     if (allow_gso != Q_THEATERQ_FLAG_NOT_SET &&
         addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(use_byteq)) < 0)
+            return -1;
+    if (enable_ecn != Q_THEATERQ_FLAG_NOT_SET &&
+        addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &enable_ecn, sizeof(enable_ecn)) < 0)
             return -1;
 
     addattr_nest_end(n, tail);
@@ -250,6 +272,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                  " bytequeue %s", tb[TCA_THEATERQ_USE_BYTEQ]);
     print_on_off(PRINT_ANY, "allow_gso", 
                  " allow_gso %s", tb[TCA_THEATERQ_ALLOW_GSO]);
+    print_on_off(PRINT_ANY, "ecn", 
+                 " ecn %s", tb[TCA_THEATERQ_ENABLE_ECN]);
 
     if (present[TCA_THEATERQ_CONT_MODE]) {
         char *cont_str = "INVALID";
@@ -304,7 +328,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                              sprint_time64(entry_current->jitter, b1));
         }
 
-        if (entry_current->rate != 0 || is_json_context())
+        if (entry_current->rate || is_json_context())
             tc_print_rate(PRINT_ANY, "rate", " rate %s", entry_current->rate);
         
         print_float(PRINT_JSON, "loss", NULL, 
@@ -316,7 +340,7 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         print_u64(PRINT_ANY, "limit", " limit %llu", 
                   (__u64) entry_current->limit);
 
-        if (entry_current->dup_prob != 0) {
+        if (entry_current->dup_prob) {
             if (is_json_context()) {
                 print_float(PRINT_JSON, "duplicate_probability", NULL,
                             (1. * entry_current->dup_prob) / UINT32_MAX);
@@ -329,6 +353,12 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                             sprint_time64(entry_current->dup_delay, b1));
             }
         }
+
+        print_float(PRINT_JSON, "reorder", NULL, 
+                    (1. * entry_current->reorder) / UINT32_MAX);
+        if (entry_current->reorder)
+            print_float(PRINT_FP, NULL, " reorder", 
+                        (100. * entry_current->reorder) / UINT32_MAX);
 
         close_json_object();
     }

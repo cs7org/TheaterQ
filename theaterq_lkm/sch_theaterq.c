@@ -21,6 +21,7 @@
 #include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/moduleparam.h>
+#include <net/inet_ecn.h>
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
 
@@ -45,6 +46,7 @@ static const struct theaterq_entry theaterq_default_entry = {
     .limit = 1000UL,
     .dup_prob = 0UL,
     .dup_delay = 0UL,
+    .reorder = 0UL,
     .next = NULL,
 };
 
@@ -86,6 +88,7 @@ struct theaterq_sched_data {
     u32 ingest_mode;
     bool use_byte_queue;
     bool allow_gso;
+    bool enable_ecn;
     struct theaterq_entry *current_entry;
     struct theaterq_entry *e_head;
     struct theaterq_entry *e_tail;
@@ -297,6 +300,14 @@ static inline bool dup_event(struct theaterq_sched_data *q)
 
     return q->current_entry->dup_prob &&
            q->current_entry->dup_prob >= prandom_u32_state(&q->prng.prng_state);
+}
+
+static inline bool reorder_event(struct theaterq_sched_data *q)
+{
+    if (!READ_ONCE(q->current_entry)) return false;
+
+    return q->current_entry->reorder &&
+           q->current_entry->reorder >= prandom_u32_state(&q->prng.prng_state);
 }
 
 static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
@@ -543,6 +554,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 u32 limit;
                 u32 dup_prob = 0;
                 u32 dup_delay = 0;
+                u32 reorder = 0;
                 struct theaterq_entry *entry;
 
                 /* Simple input format:
@@ -550,8 +562,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                  *  µs     ns    bps    a)    b)
                  * 
                  * Extended input format:
-                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY\n
-                 *  µs     ns      ns   bps   a)    b)     a)       ns
+                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY,REORDER\n
+                 *  µs     ns      ns   bps   a)    b)     a)       ns       a)
                  * 
                  * a) Scaled u32: 0 = 0%, U32_MAX = 100%, kernel does not 
                  *  support floating point numbers
@@ -587,6 +599,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 PARSE_TOKEN(kstrtou32, &limit);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &dup_prob);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &dup_delay);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &reorder);
 
 #undef PARSE_TOKEN_EXTENDED
 #undef PARSE_TOKEN
@@ -626,9 +639,10 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 entry->rate = rate / 8; // bits per second -> byte per second
                 entry->loss = loss;
                 entry->limit = limit;
-                entry->next = NULL;
                 entry->dup_prob = dup_prob;
                 entry->dup_delay = dup_delay;
+                entry->reorder = reorder;
+                entry->next = NULL;
 
                 if (q->e_head == NULL) {
                     q->e_head = entry;
@@ -806,6 +820,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     s64 now = ktime_get_ns();
     s64 delay = 0;
     u64 check_len;
+    bool orphaned = false;
 
     if (current_entry)
         delay = get_pkt_delay(current_entry->latency, 
@@ -819,10 +834,11 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
-    if (current_entry && (current_entry->latency || 
-        current_entry->jitter || current_entry->rate || 
-        (q->isdup && current_entry->dup_delay)))
+    if (current_entry && 
+        (current_entry->rate || current_entry->latency || current_entry->jitter)) {
             skb_orphan_partial(skb);
+            orphaned = true;
+    }
 
     if (!q->isdup && dup_event(q) && 
         (dup_skb = skb_clone(skb, GFP_ATOMIC)) != NULL) {
@@ -832,19 +848,33 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             q->isdup = true;
             rootq->enqueue(dup_skb, rootq, to_free);
             q->isdup = false;
+
             delay += current_entry->dup_delay;
+            if (!orphaned && current_entry->dup_delay)
+                skb_orphan_partial(skb);
     }
 
     check_len = q->use_byte_queue ? 
                     q->t_blen + qdisc_pkt_len(skb) : q->t_len;
 
     if (unlikely(current_entry && check_len >= current_entry->limit)) {
+        if (q->enable_ecn)
+            INET_ECN_set_ce(skb);
+
         qdisc_drop_all(skb, sch, to_free);
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
+
+    if (reorder_event(q)) {
+        cb->time_to_send = now + delay;
+        __qdisc_enqueue_head(skb, &sch->q);
+        qdisc_watchdog_schedule_ns(&q->watchdog, cb->time_to_send);
+        sch->qstats.requeues++;
+        return NET_XMIT_SUCCESS;
+    }
 
     if (current_entry && current_entry->rate) {
         struct theaterq_skb_cb *last = NULL;
@@ -963,9 +993,23 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct sk_buff *skb;
+    u64 now = ktime_get_ns();
+    u64 time_to_send;
 
 tfifo_dequeue:
-    skb = __qdisc_dequeue_head(&sch->q);
+    skb = sch->q.head;
+
+    if (skb) {
+        time_to_send = theaterq_skb_cb(skb)->time_to_send;
+
+        if (time_to_send <= now) {
+            skb = __qdisc_dequeue_head(&sch->q);
+        } else {
+            qdisc_watchdog_schedule_ns(&q->watchdog, time_to_send);
+            skb = NULL;
+        }
+    }
+
     if (skb) {
 deliver:
         qdisc_qstats_backlog_dec(sch, skb);
@@ -975,8 +1019,8 @@ deliver:
 
     skb = theaterq_peek(q);
     if (skb) {
-        u64 time_to_send = theaterq_skb_cb(skb)->time_to_send;
-        u64 now = ktime_get_ns();
+        time_to_send = theaterq_skb_cb(skb)->time_to_send;
+        now = ktime_get_ns();
         unsigned int pkt_len = qdisc_pkt_len(skb);
 
         if (time_to_send <= now) {
@@ -1039,6 +1083,7 @@ static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
     [TCA_THEATERQ_SYNCGRP]      = { .type = NLA_S32 },
     [TCA_THEATERQ_USE_BYTEQ]    = { .type = NLA_U8  },
     [TCA_THEATERQ_ALLOW_GSO]    = { .type = NLA_U8  },
+    [TCA_THEATERQ_ENABLE_ECN]   = { .type = NLA_U8  },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
@@ -1109,6 +1154,9 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 
     if (tb[TCA_THEATERQ_ALLOW_GSO])
         q->allow_gso = nla_get_u8(tb[TCA_THEATERQ_ALLOW_GSO]) != 0;
+
+    if (tb[TCA_THEATERQ_ENABLE_ECN])
+        q->enable_ecn = nla_get_u8(tb[TCA_THEATERQ_ENABLE_ECN]) != 0;
 
     sch_tree_unlock(sch);
 
@@ -1234,10 +1282,6 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
                           q->e_current, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
-     if (q->use_byte_queue && nla_put_u8(skb, TCA_THEATERQ_USE_BYTEQ,
-                                         q->use_byte_queue))
-        goto nla_put_failure;
-
     if (q->current_entry) {
         memcpy(&current_entry, q->current_entry, sizeof(current_entry));
         current_entry.next = NULL;
@@ -1247,8 +1291,16 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
             goto nla_put_failure;
     }
 
+    if (q->use_byte_queue && nla_put_u8(skb, TCA_THEATERQ_USE_BYTEQ,
+                                        q->use_byte_queue))
+        goto nla_put_failure;
+
     if (q->allow_gso && nla_put_u8(skb, TCA_THEATERQ_ALLOW_GSO,
                                    q->allow_gso))
+        goto nla_put_failure;
+
+    if (q->enable_ecn && nla_put_u8(skb, TCA_THEATERQ_ENABLE_ECN,
+                                    q->enable_ecn))
         goto nla_put_failure;
 
     return nla_nest_end(skb, opts);
