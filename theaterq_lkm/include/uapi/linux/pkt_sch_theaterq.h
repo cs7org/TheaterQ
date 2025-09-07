@@ -64,7 +64,6 @@ struct theaterq_entry {
     __u32 limit;
     __u32 dup_prob;
     __u32 dup_delay;
-    __u32 reorder;
     struct theaterq_entry *next;
 };
 
@@ -72,8 +71,8 @@ struct tc_theaterq_xstats {
     __u64 looped;
     __u64 total_time;
     __u64 total_entries;
-    __u32 tfifo_plen;
-    __u64 tfifo_blen;
+    __u32 edfq_plen;
+    __u64 edfq_blen;
 };
 
 #endif //__LINUX_PKT_SCH_THEATERQ_H

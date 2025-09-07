@@ -46,7 +46,6 @@ static const struct theaterq_entry theaterq_default_entry = {
     .limit = 1000UL,
     .dup_prob = 0UL,
     .dup_delay = 0UL,
-    .reorder = 0UL,
     .next = NULL,
 };
 
@@ -64,9 +63,11 @@ enum {
 struct theaterq_syngrp;
 
 struct theaterq_sched_data {
+    // Earliest Deadline First skb queue
     struct rb_root t_root;
     struct sk_buff *t_head;
     struct sk_buff *t_tail;
+    u64 t_busy_time;
 
     u32 t_len;
     u64 t_blen;
@@ -113,9 +114,7 @@ struct theaterq_sched_data {
     atomic_t t_running;
     u64 t_started;
     struct hrtimer timer;
-
     struct theaterq_syngrp *syngrp;
-
     struct tc_theaterq_xstats stats;
 };
 
@@ -127,7 +126,8 @@ struct theaterq_syngrp {
 static struct theaterq_syngrp *theaterq_syngrps = NULL;
 
 struct theaterq_skb_cb {
-    u64 time_to_send;
+    u64 earliest_send_time;
+    u64 transmit_time;
 };
 
 // SYNC GROUPS =================================================================
@@ -136,6 +136,7 @@ struct theaterq_skb_cb {
 static void theaterq_stop_hrtimer(struct theaterq_sched_data *, bool, bool);
 static int theaterq_run_hrtimer(struct theaterq_sched_data *, bool);
 static void entry_list_clear(struct theaterq_sched_data *);
+static struct sk_buff *theaterq_peek(struct theaterq_sched_data *);
 
 static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q, 
                                        bool clear_others)
@@ -302,15 +303,7 @@ static inline bool dup_event(struct theaterq_sched_data *q)
            q->current_entry->dup_prob >= prandom_u32_state(&q->prng.prng_state);
 }
 
-static inline bool reorder_event(struct theaterq_sched_data *q)
-{
-    if (!READ_ONCE(q->current_entry)) return false;
-
-    return q->current_entry->reorder &&
-           q->current_entry->reorder >= prandom_u32_state(&q->prng.prng_state);
-}
-
-static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
+static inline s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
 {
     u32 rnd;
 
@@ -321,7 +314,7 @@ static s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
     return ((rnd % (2 * (u32) sigma)) + mu) - sigma;
 }
 
-static u64 packet_time_ns(u64 len, const struct theaterq_sched_data *q)
+static inline u64 packet_time_ns(u64 len, const struct theaterq_sched_data *q)
 {
     if (!q->current_entry)
         return 0ul;
@@ -330,12 +323,12 @@ static u64 packet_time_ns(u64 len, const struct theaterq_sched_data *q)
     return div64_u64(len * NSEC_PER_SEC, q->current_entry->rate);
 }
 
-static void tfifo_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
+static void edfq_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
-    u64 tnext = theaterq_skb_cb(nskb)->time_to_send;
+    u64 tnext = theaterq_skb_cb(nskb)->earliest_send_time;
 
-    if (!q->t_tail || tnext >= theaterq_skb_cb(q->t_tail)->time_to_send) {
+    if (!q->t_tail || tnext >= theaterq_skb_cb(q->t_tail)->earliest_send_time) {
         if (q->t_tail)
             q->t_tail->next = nskb;
         else
@@ -351,7 +344,7 @@ static void tfifo_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
 
             parent = *p;
             skb = rb_to_skb(parent);
-            if (tnext >= theaterq_skb_cb(skb)->time_to_send)
+            if (tnext >= theaterq_skb_cb(skb)->earliest_send_time)
                 p = &parent->rb_right;
             else
                 p = &parent->rb_left;
@@ -366,7 +359,7 @@ static void tfifo_enqueue(struct sk_buff *nskb, struct Qdisc *sch)
     sch->q.qlen++;
 }
 
-static void tfifo_reset(struct Qdisc *sch)
+static void edfq_reset(struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct rb_node *p = rb_first(&q->t_root);
@@ -438,6 +431,7 @@ static int theaterq_run_hrtimer(struct theaterq_sched_data *q,
     WRITE_ONCE(q->current_entry, q->e_head);
     q->current_entry = q->e_head;
     q->e_current = 0;
+    q->t_busy_time = 0;
 
     if (!q->current_entry->next) {
         ret = -EINVAL;
@@ -554,7 +548,6 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 u32 limit;
                 u32 dup_prob = 0;
                 u32 dup_delay = 0;
-                u32 reorder = 0;
                 struct theaterq_entry *entry;
 
                 /* Simple input format:
@@ -562,8 +555,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                  *  µs     ns    bps    a)    b)
                  * 
                  * Extended input format:
-                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY,REORDER\n
-                 *  µs     ns      ns   bps   a)    b)     a)       ns       a)
+                 * DELAY,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY\n
+                 *  µs     ns      ns   bps   a)    b)     a)       ns
                  * 
                  * a) Scaled u32: 0 = 0%, U32_MAX = 100%, kernel does not 
                  *  support floating point numbers
@@ -599,7 +592,6 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 PARSE_TOKEN(kstrtou32, &limit);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &dup_prob);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &dup_delay);
-                PARSE_TOKEN_EXTENDED(kstrtou32, &reorder);
 
 #undef PARSE_TOKEN_EXTENDED
 #undef PARSE_TOKEN
@@ -641,7 +633,6 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 entry->limit = limit;
                 entry->dup_prob = dup_prob;
                 entry->dup_delay = dup_delay;
-                entry->reorder = reorder;
                 entry->next = NULL;
 
                 if (q->e_head == NULL) {
@@ -771,6 +762,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
                 WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
                 atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
                 q->e_current = 0;
+                q->t_busy_time = 0;
                 return HRTIMER_NORESTART;
 
             case THEATERQ_CONT_HOLD:
@@ -868,47 +860,22 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
 
-    if (reorder_event(q)) {
-        cb->time_to_send = now + delay;
-        __qdisc_enqueue_head(skb, &sch->q);
-        qdisc_watchdog_schedule_ns(&q->watchdog, cb->time_to_send);
-        sch->qstats.requeues++;
-        return NET_XMIT_SUCCESS;
+    cb->earliest_send_time = now + delay;
+    cb->transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
+    edfq_enqueue(skb, sch);
+
+    struct sk_buff *first = theaterq_peek(q);
+    u64 first_send_time;
+    if (!first) {
+        if (q->t_busy_time < cb->earliest_send_time)
+            qdisc_watchdog_schedule_ns(&q->watchdog, cb->earliest_send_time);
+    } else {
+        first_send_time = theaterq_skb_cb(first)->earliest_send_time;
+        if (first_send_time > cb->earliest_send_time && 
+            q->t_busy_time < cb->earliest_send_time)
+                qdisc_watchdog_schedule_ns(&q->watchdog, cb->earliest_send_time);
     }
 
-    if (current_entry && current_entry->rate) {
-        struct theaterq_skb_cb *last = NULL;
-
-        if (sch->q.tail) {
-            last = theaterq_skb_cb(sch->q.tail);
-        }
-
-        if (q->t_root.rb_node) {
-            struct sk_buff *t_skb = skb_rb_last(&q->t_root);
-            struct theaterq_skb_cb *t_last = theaterq_skb_cb(t_skb);
-
-            if (!last || t_last->time_to_send > last->time_to_send)
-                last = t_last;
-        }
-
-        if (q->t_tail) {
-            struct theaterq_skb_cb *t_last = theaterq_skb_cb(q->t_tail);
-
-            if (!last || t_last->time_to_send > last->time_to_send)
-                last = t_last;
-        }
-
-        if (last) {
-            delay -= last->time_to_send - now;
-            delay = max_t(s64, 0, delay);
-            now = last->time_to_send;
-        }
-
-        delay += packet_time_ns(qdisc_pkt_len(skb), q);
-    }
-
-    cb->time_to_send = now + delay;
-    tfifo_enqueue(skb, sch);
     return NET_XMIT_SUCCESS;
 }
 
@@ -969,8 +936,8 @@ static struct sk_buff *theaterq_peek(struct theaterq_sched_data *q)
     if (!skb) return q->t_head;
     if (!q->t_head) return skb;
 
-    t1 = theaterq_skb_cb(skb)->time_to_send;
-    t2 = theaterq_skb_cb(q->t_head)->time_to_send;
+    t1 = theaterq_skb_cb(skb)->earliest_send_time;
+    t2 = theaterq_skb_cb(q->t_head)->earliest_send_time;
 
     if (t1 < t2)
         return skb;
@@ -994,22 +961,9 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct sk_buff *skb;
     u64 now = ktime_get_ns();
-    u64 time_to_send;
-
-tfifo_dequeue:
-    skb = sch->q.head;
-
-    if (skb) {
-        time_to_send = theaterq_skb_cb(skb)->time_to_send;
-
-        if (time_to_send <= now) {
-            skb = __qdisc_dequeue_head(&sch->q);
-        } else {
-            qdisc_watchdog_schedule_ns(&q->watchdog, time_to_send);
-            skb = NULL;
-        }
-    }
-
+    
+edfq_dequeue:
+    skb = __qdisc_dequeue_head(&sch->q);
     if (skb) {
 deliver:
         qdisc_qstats_backlog_dec(sch, skb);
@@ -1019,37 +973,43 @@ deliver:
 
     skb = theaterq_peek(q);
     if (skb) {
-        time_to_send = theaterq_skb_cb(skb)->time_to_send;
-        now = ktime_get_ns();
-        unsigned int pkt_len = qdisc_pkt_len(skb);
+        u64 earliest_send_time = theaterq_skb_cb(skb)->earliest_send_time;
 
-        if (time_to_send <= now) {
-            theaterq_erase_head(q, skb);
-            q->t_len--;
-            q->t_blen -= pkt_len;
-            skb->next = NULL;
-            skb->prev = NULL;
-            skb->dev = qdisc_dev(sch);
+        if (now <= q->t_busy_time) {
+            u64 next_send = max_t(u64, q->t_busy_time, earliest_send_time);
+            qdisc_watchdog_schedule_ns(&q->watchdog, next_send);
+        } else {
+            unsigned int pkt_len = qdisc_pkt_len(skb);
 
-            if (q->qdisc) {
-                struct sk_buff *to_free = NULL;
-                int err;
+            if (earliest_send_time <= now) {
+                theaterq_erase_head(q, skb);
+                q->t_len--;
+                q->t_blen -= pkt_len;
+                skb->next = NULL;
+                skb->prev = NULL;
+                skb->dev = qdisc_dev(sch);
+                q->t_busy_time = now + theaterq_skb_cb(skb)->transmit_time;
 
-                err = qdisc_enqueue(skb, q->qdisc, &to_free);
-                kfree_skb_list(to_free);
+                if (q->qdisc) {
+                    struct sk_buff *to_free = NULL;
+                    int err;
 
-                if (err != NET_XMIT_SUCCESS) {
-                    if (net_xmit_drop_count(err)) qdisc_qstats_drop(sch);
-                    sch->qstats.backlog -= pkt_len;
-                    sch->q.qlen--;
-                    qdisc_tree_reduce_backlog(sch, 1, pkt_len);
+                    err = qdisc_enqueue(skb, q->qdisc, &to_free);
+                    kfree_skb_list(to_free);
+
+                    if (err != NET_XMIT_SUCCESS) {
+                        if (net_xmit_drop_count(err)) qdisc_qstats_drop(sch);
+                        sch->qstats.backlog -= pkt_len;
+                        sch->q.qlen--;
+                        qdisc_tree_reduce_backlog(sch, 1, pkt_len);
+                    }
+
+                    goto edfq_dequeue;
                 }
 
-                goto tfifo_dequeue;
+                sch->q.qlen--;
+                goto deliver;
             }
-
-            sch->q.qlen--;
-            goto deliver;
         }
 
         if (q->qdisc) {
@@ -1060,7 +1020,7 @@ deliver:
             }
         }
 
-        qdisc_watchdog_schedule_ns(&q->watchdog, time_to_send);
+        qdisc_watchdog_schedule_ns(&q->watchdog, earliest_send_time);
     }
 
     if (q->qdisc) {
@@ -1111,6 +1071,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 
         if (new_stage == THEATERQ_STAGE_CLEAR) {
             theaterq_stop_hrtimer(q, true, true);
+            q->t_busy_time = 0;
             entry_list_clear(q);
             new_stage = THEATERQ_STAGE_LOAD;
         } else if (new_stage == THEATERQ_STAGE_LOAD && 
@@ -1193,6 +1154,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->allow_gso = false;
     q->syngrp = NULL;
     q->isdup = false;
+    q->t_busy_time = 0ULL;
 
     qdisc_watchdog_init(&q->watchdog, sch);
 
@@ -1220,10 +1182,11 @@ static void theaterq_reset(struct Qdisc *sch)
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
     qdisc_reset_queue(sch);
-    tfifo_reset(sch);
+    edfq_reset(sch);
     theaterq_stop_hrtimer(q, false, false);
     theaterq_syncgroup_leave(q);
     theaterq_stats_clear(&q->stats);
+    q->t_busy_time = 0;
     if (q->qdisc) qdisc_reset(q->qdisc);
     qdisc_watchdog_cancel(&q->watchdog);
 }
@@ -1317,8 +1280,8 @@ static int theaterq_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
     struct tc_theaterq_xstats stats = {};
     memcpy(&stats, &q->stats, sizeof(stats));
 
-    stats.tfifo_plen = q->t_len;
-    stats.tfifo_blen = q->t_blen;
+    stats.edfq_plen = q->t_len;
+    stats.edfq_blen = q->t_blen;
 
     return gnet_stats_copy_app(d, &stats, sizeof(stats));
 }

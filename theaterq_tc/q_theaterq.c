@@ -354,12 +354,6 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
             }
         }
 
-        print_float(PRINT_JSON, "reorder", NULL, 
-                    (1. * entry_current->reorder) / UINT32_MAX);
-        if (entry_current->reorder)
-            print_float(PRINT_FP, NULL, " reorder", 
-                        (100. * entry_current->reorder) / UINT32_MAX);
-
         close_json_object();
     }
 
@@ -383,10 +377,10 @@ static int theaterq_print_xstats(const struct qdisc_util *qu, FILE *f,
         stats = &_stats;
     }
 
-    print_u64(PRINT_FP, NULL, " tfifo %llub", stats->tfifo_blen);
-    print_u64(PRINT_FP, NULL, " %llup", stats->tfifo_plen);
-    print_u64(PRINT_JSON, "tfifo_blen", NULL, stats->tfifo_blen);
-    print_u64(PRINT_JSON, "tfifo_plen", NULL, stats->tfifo_plen);
+    print_u64(PRINT_FP, NULL, " tfifo %llub", stats->edfq_blen);
+    print_u64(PRINT_FP, NULL, " %llup", stats->edfq_plen);
+    print_u64(PRINT_JSON, "tfifo_blen", NULL, stats->edfq_blen);
+    print_u64(PRINT_JSON, "tfifo_plen", NULL, stats->edfq_plen);
     print_u64(PRINT_ANY, "looped", " looped %llu", stats->looped);
     print_string(PRINT_FP, NULL, " duration %s", 
                  sprint_time64(stats->total_time, b1));
