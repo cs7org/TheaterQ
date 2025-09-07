@@ -316,8 +316,8 @@ static inline s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
 
 static inline u64 packet_time_ns(u64 len, const struct theaterq_sched_data *q)
 {
-    if (!q->current_entry)
-        return 0ul;
+    if (!q->current_entry || q->current_entry->rate == 0)
+        return 0ULL;
 
     len += q->packet_overhead;
     return div64_u64(len * NSEC_PER_SEC, q->current_entry->rate);
@@ -975,7 +975,7 @@ deliver:
     if (skb) {
         u64 earliest_send_time = theaterq_skb_cb(skb)->earliest_send_time;
 
-        if (now <= q->t_busy_time) {
+        if (now < q->t_busy_time) {
             u64 next_send = max_t(u64, q->t_busy_time, earliest_send_time);
             qdisc_watchdog_schedule_ns(&q->watchdog, next_send);
         } else {
@@ -1010,6 +1010,8 @@ deliver:
                 sch->q.qlen--;
                 goto deliver;
             }
+
+            qdisc_watchdog_schedule_ns(&q->watchdog, earliest_send_time);
         }
 
         if (q->qdisc) {
@@ -1019,8 +1021,6 @@ deliver:
                 goto deliver;
             }
         }
-
-        qdisc_watchdog_schedule_ns(&q->watchdog, earliest_send_time);
     }
 
     if (q->qdisc) {

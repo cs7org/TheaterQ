@@ -40,6 +40,7 @@ Types are identical in both formats. Default format is `SIMPLE`, during creation
 - **`DUP_PROB`** and **`DUP_DELAY`**: Probability for a packet to be duplicated, as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format). The duplicate will be statically delayed **`DUP_DELAY`** ns. A duplicated packet processed like any other, thus it is additionally affected by the `DELAY` and `JITTER`.
 
 On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
+Please note that rapid changes of the `DELAY` values or high `JITTER` values will lead to implicit packet reordering.
 
 ## Usage
 Install the kernel module and set `TC_LIB_DIR`:
@@ -65,7 +66,10 @@ TheaterQ is used in the following way:
    ```
    - `stage ARM` will start the playback when the first packet is transmitted. `stage RUN` will start the playback immediately.
    - `cont LOOP` will restart at the beginning of the Trace File after the end was reached, `cont HOLD` will hold the last values of the Trace File, and `cont CLEAR` will reset the qdisc to transparent operation.
-   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length, `pktqlen` will switch it back to packets (default: packets).  The `allow_gso`/`prevent_gso` flag disables/enables automatic GSO packet segmentation (default: disabled).
+   - Additionally, a seed for the jitter/loss random generator and a packet overhead for the rate calculation can be specified, see `tc qdisc add theaterq help` for further details. 
+   The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length, `pktqlen` will switch it back to packets (default: packets).
+   The `allow_gso`/`prevent_gso` flag disables/enables automatic GSO packet segmentation (default: disabled). 
+   Use `ecn_enable`/`ecn_disbale` to configure whether RFC 3168 ECNs should be sent when queue length limit (*`<LIMIT>`*) is reached (default: disabled).
 4. By using 
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage LOAD
@@ -80,7 +84,7 @@ TheaterQ is used in the following way:
 Multiple TheaterQ qdisc instances can be added to syncgroups, e.g. to sync the Trace File replay between a forward and return link. Use the following workflow:
 1. Create both qdiscs on different interfaces but add the `syncgroup <group>` option. All qdiscs with the same syncgroup number will be started synchronously. With default settings, 8 syncgroups are available (0-7), while each group can have up to 8 members. To add a syncgroup, they have to be in stage `LOAD`, `ARM` or `FINISH`.
 2. Load the Trace Files. Note: Trace files can have different entries and lengths, just the start point is synchronized between the groups.
-3. Setting one qdisc to the `RUN` stage will set all the other to `RUN`, whenever possible (e.g. a Trace File was ingested and they are in a suitable stage).
+3. Setting one qdisc to the `RUN` stage will set all the other to `RUN`, whenever possible (e.g. a Trace File was ingested, and they are in a suitable stage).
 It is also possible to set one or more qdiscs to the `ARM` stage; in this case, the first received packet on any qdisc in this stage and group will set all members and itself to `RUN`.
 4. Setting one qdisc of a group to stage `LOAD` or `CLEAR` will set all other members to `LOAD` and stop the Trace File replay.
 5. Pass to `syncgroup -1` to a qdisc to leave the current syncgroup.
@@ -96,7 +100,7 @@ tc [-j] qdisc show dev <oif> handle <major>
 Important values:
 - `entries`: Loaded Trace File entries
 - `position`: Currently applied Trace File entry (starting with 0, only valid when stage is `RUN` or `FINISHED`)
-- `delay`, `jitter`, `rate`, `loss`, `limit`: Currently active link emulation setting from the Trace File. 
+- `delay`, `jitter`, `rate`, `loss`, `limit`, `duplicate_probability`, `duplicate_delay`: Currently active link emulation setting from the Trace File. 
 
 The xstats subsystem can be used to obtain additional statistics, use `-j` for a JSON representation.
 ```bash
