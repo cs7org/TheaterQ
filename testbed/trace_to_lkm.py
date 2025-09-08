@@ -4,7 +4,7 @@ import argparse
 import subprocess
 
 def load_theaterq(interface: str, trace: str) -> None:
-    command = f"TC_LIB_DIR=/var/local/tclib tc qdisc add dev {interface} root handle 5 theaterq stage LOAD"
+    command = f"TC_LIB_DIR=/var/local/tclib tc qdisc add dev {interface} root handle 5 theaterq stage LOAD ingest EXTENDED"
     proc = subprocess.run(command, shell=True)
     if proc.returncode != 0:
         raise Exception("Unable to add qdisc")
@@ -18,17 +18,17 @@ def load_theaterq(interface: str, trace: str) -> None:
         prev = 0
         for trace in traces:
             # Trace Format: at,delay,stddev,link_cap,queue_capacity,hops,ratio
-            # LKM Format: <DELAY>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>\n
+            # LKM Format: <DELAY>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>\n
 
             at, delay, stddev, min_link_cap, queue_cap, drops = trace.replace("\n", "").split(",")
-            at_lkm = int(at) * 1000
+            at_lkm = int(at)
             delay_lkm = max(0, int(delay) * 1000 - (1000 * 1000))
             jitter_lkm = int(float(stddev) * 1000)
             rate_lkm = int(float(min_link_cap))
             queue_cap_lkm = int((((float(min_link_cap) / 8) * (int(delay) / (1000 * 1000))) / 1024) * 0.5) + int(int(queue_cap) * 0.5)
             drops_lkm = int(round(float(drops) * 4294967295))
 
-            handle.write(f"{at_lkm - prev},{delay_lkm},{jitter_lkm},{rate_lkm},{drops_lkm},{queue_cap_lkm}\n")
+            handle.write(f"{at_lkm - prev},{delay_lkm},{jitter_lkm},{rate_lkm},{drops_lkm},{queue_cap_lkm},0,0\n")
             prev = at_lkm
 
 
