@@ -22,11 +22,9 @@
 #include <linux/cdev.h>
 #include <linux/moduleparam.h>
 #include <net/inet_ecn.h>
+#include <linux/ctype.h>
 
 #include "include/uapi/linux/pkt_sch_theaterq.h"
-
-// TODO Area:
-// - Use tbf in dequeue
 
 // DATA + HELPER FUNCTIONS =====================================================
 
@@ -491,6 +489,8 @@ static int ingest_cdev_release(struct inode *inode, struct file *filp)
     struct theaterq_sched_data *q = filp->private_data;
     atomic_set(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE);
 
+    q->ingest_helper.lpos = 0;
+
     module_put(THIS_MODULE);
     return 0;
 }
@@ -537,6 +537,11 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
 
             if (c == '\n') {
                 if (q->ingest_helper.lpos == 1) continue;
+
+                if (!isdigit(q->ingest_helper.lbuf[0])) {
+                    q->ingest_helper.lpos = 0;
+                    continue;
+                }
 
                 q->ingest_helper.lbuf[q->ingest_helper.lpos - 1] = '\0';
 

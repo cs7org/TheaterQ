@@ -18,5 +18,5 @@ insmod $TESTBED_PACKAGE/sch_theaterq.ko
 install -m 0655 -d /var/local/tclib
 cp $TESTBED_PACKAGE/q_theaterq.so /var/local/tclib/.
 
-python3 trace_to_lkm.py -i $FORWARD_LINK -t $TESTBED_PACKAGE/$FORWARD_TRACE load
-python3 trace_to_lkm.py -i $RETURN_LINK -t $TESTBED_PACKAGE/$RETURN_TRACE load
+#python3 trace_to_lkm.py -i $FORWARD_LINK -t $TESTBED_PACKAGE/$FORWARD_TRACE load
+#python3 trace_to_lkm.py -i $RETURN_LINK -t $TESTBED_PACKAGE/$RETURN_TRACE load
