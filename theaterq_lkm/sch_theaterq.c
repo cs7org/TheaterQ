@@ -759,7 +759,7 @@ static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
                 WRITE_ONCE(q->current_entry, q->e_head);
                 break;
 
-            case THEATERQ_CONT_CLEAR:
+            case THEATERQ_CONT_CLEAN:
                 WRITE_ONCE(q->current_entry, 
                            (struct theaterq_entry *) &theaterq_default_entry);
 
@@ -854,7 +854,10 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     check_len = q->use_byte_queue ? 
                     q->t_blen + qdisc_pkt_len(skb) : q->t_len;
 
-    if (unlikely(current_entry && check_len >= current_entry->limit)) {
+    if (unlikely(current_entry && 
+                 current_entry->limit && 
+                 check_len >= current_entry->limit)) {
+        
         if (q->enable_ecn)
             INET_ECN_set_ce(skb);
 

@@ -75,8 +75,8 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
                 cont = THEATERQ_CONT_LOOP;
             } else if (strcmp(*argv, "HOLD") == 0) {
                 cont = THEATERQ_CONT_HOLD;
-            } else if (strcmp(*argv, "CLEAR") == 0) {
-                cont = THEATERQ_CONT_CLEAR;
+            } else if (strcmp(*argv, "CLEAN") == 0) {
+                cont = THEATERQ_CONT_CLEAN;
             } else {
                 fprintf(stderr, "Unsupported continue mode \"%s\".\n", *argv);
                 explain();
@@ -282,8 +282,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
             cont_str = "HOLD";
         else if (cont == THEATERQ_CONT_LOOP)
             cont_str = "LOOP";
-        else if (cont == THEATERQ_CONT_CLEAR)
-            cont_str = "CLEAR";
+        else if (cont == THEATERQ_CONT_CLEAN)
+            cont_str = "CLEAN";
 
         print_string(PRINT_ANY, "cont_mode", " cont_mode %s", cont_str);
     }
