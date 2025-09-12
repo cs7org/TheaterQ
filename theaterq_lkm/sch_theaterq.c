@@ -31,6 +31,7 @@
 #define THEATERQ_INGEST_MAXLEN 256
 #define THEATERQ_NO_SYNCGRP_SELECTED -2
 #define THEATERQ_NS_PER_US 1000
+#define THEATERQ_NO_EXPIRY U64_MAX
 
 static struct kmem_cache *theaterq_cache = NULL;
 static DEFINE_SPINLOCK(theaterq_tree_lock);
@@ -38,7 +39,7 @@ static u8 syngrps = 8;
 static u8 syngrps_members = 8;
 
 static const struct theaterq_entry theaterq_default_entry = {
-    .delay = U64_MAX,
+    .delay = THEATERQ_NO_EXPIRY,
     .latency = 0ULL,
     .jitter = 0ULL,
     .rate = 0ULL,
@@ -180,7 +181,11 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
     spin_lock_bh(&theaterq_tree_lock);
 
     if (!q->syngrp) {
-        theaterq_start_replay(q, now);
+        if (q->stage == THEATERQ_STAGE_LOAD ||
+            q->stage == THEATERQ_STAGE_FINISH ||
+            q->stage == THEATERQ_STAGE_ARM)
+                theaterq_start_replay(q, now);
+
         goto unlock;
     }
 
@@ -412,7 +417,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
 {
     if (!q->e_head) {
         q->stage = THEATERQ_STAGE_LOAD;
-        q->t_updated = U64_MAX;
+        q->t_updated = THEATERQ_NO_EXPIRY;
          WRITE_ONCE(q->current_entry, 
               (struct theaterq_entry *) &theaterq_default_entry);
         return -EINVAL;
@@ -433,7 +438,7 @@ static void theaterq_stop_replay(struct theaterq_sched_data *q)
 {
     WRITE_ONCE(q->current_entry, 
               (struct theaterq_entry *) &theaterq_default_entry);
-    q->t_updated = U64_MAX;
+    q->t_updated = THEATERQ_NO_EXPIRY;
 }
 
 // CHARDEV OPS =================================================================
@@ -587,10 +592,10 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     return -EINVAL;
                 }
 
-                if (delay >= U64_MAX / THEATERQ_NS_PER_US) {
+                if (delay >= THEATERQ_NO_EXPIRY / THEATERQ_NS_PER_US) {
                     printk(KERN_WARNING 
                            "sch_theaterq: Delay value too large, max is %lld!\n",
-                            (U64_MAX / THEATERQ_NS_PER_US) - 1);
+                            (THEATERQ_NO_EXPIRY / THEATERQ_NS_PER_US) - 1);
                     return -EINVAL;
                 }
 
@@ -742,7 +747,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     u64 check_len;
     bool orphaned = false;
 
-    if (unlikely(current_entry->delay != U64_MAX && 
+    if (unlikely(current_entry->delay != THEATERQ_NO_EXPIRY && 
                  q->t_updated + current_entry->delay <= now)) {
         while (now - q->t_updated >= current_entry->delay) {
             q->t_updated += current_entry->delay;
@@ -757,7 +762,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                     case THEATERQ_CONT_CLEAN:
                         WRITE_ONCE(current_entry, 
                                   (struct theaterq_entry *) &theaterq_default_entry);
-                        q->t_updated = U64_MAX;
+                        q->t_updated = THEATERQ_NO_EXPIRY;
                         q->e_current = 0;
                         q->t_busy_time = 0;
                         q->stage = THEATERQ_STAGE_FINISH;
@@ -766,7 +771,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                         /* fallthrough */
                     default:
                         q->stage = THEATERQ_STAGE_FINISH;
-                        q->t_updated = U64_MAX;
+                        q->t_updated = THEATERQ_NO_EXPIRY;
                         goto leave_update_loop;
                 }
             } else {
@@ -1128,7 +1133,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->syngrp = NULL;
     q->isdup = false;
     q->t_busy_time = 0ULL;
-    q->t_updated = 0ULL;
+    q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
 
     qdisc_watchdog_init(&q->watchdog, sch);
