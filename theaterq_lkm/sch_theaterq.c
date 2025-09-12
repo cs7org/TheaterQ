@@ -58,7 +58,7 @@ enum {
 enum {
     THEATERQ_REPLAY_UNCHANGED = 0,
     THEATERQ_REPLAY_STOP = 1,
-    THEATERQ_REPLAY_START = 3,
+    THEATERQ_REPLAY_START = 2,
     THEATERQ_REPLAY_CLEAR = 4,
 };
 
@@ -75,6 +75,7 @@ struct theaterq_sched_data {
     u32 t_len;
     u64 t_blen;
 
+    struct Qdisc *parent;
     struct Qdisc *qdisc;
     struct qdisc_watchdog watchdog;
 
@@ -401,6 +402,7 @@ static void entry_list_clear(struct theaterq_sched_data *q)
     q->e_head = NULL;
     q->e_tail = NULL;
     q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
+    q->e_current = 0;
     q->e_entries = 0;
     q->deletion_pending = false;
 }
@@ -599,12 +601,6 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     return -EINVAL;
                 }
 
-                if (q->stage != THEATERQ_STAGE_LOAD || q->deletion_pending) {
-                    printk(KERN_WARNING 
-                           "sch_theaterq: Qdisc not in load stage, or deletion pending.\n");
-                    return -EBUSY;
-                }
-
                 entry = kmem_cache_alloc(theaterq_cache, GFP_KERNEL);
                 if (!entry) {
                     printk(KERN_ERR 
@@ -622,6 +618,15 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 entry->dup_delay = dup_delay;
                 entry->next = NULL;
 
+                //sch_tree_lock(q->parent);
+                if (q->stage != THEATERQ_STAGE_LOAD || q->deletion_pending) {
+                    printk(KERN_WARNING 
+                           "sch_theaterq: Qdisc not in load stage, or deletion pending.\n");
+                    //sch_tree_unlock(q->parent);
+                    // TODO: kfree
+                    return -EBUSY;
+                }
+
                 if (q->e_head == NULL) {
                     q->e_head = entry;
                     q->e_tail = entry;
@@ -631,6 +636,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 }
 
                 q->e_entries++;
+                //sch_tree_unlock(q->parent);
             }
         }
 
@@ -747,6 +753,11 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     u64 check_len;
     bool orphaned = false;
 
+#define UPDATE_PRIV_LOCAL(new) do { \
+                            WRITE_ONCE(q->current_entry, new); \
+                            current_entry = q->current_entry; \
+                        } while (0)
+
     if (unlikely(current_entry->delay != THEATERQ_NO_EXPIRY && 
                  q->t_updated + current_entry->delay <= now)) {
         while (now - q->t_updated >= current_entry->delay) {
@@ -755,17 +766,18 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             if (!current_entry->next) {
                 switch (q->cont_mode) {
                     case THEATERQ_CONT_LOOP:
-                        WRITE_ONCE(q->current_entry, q->e_head);
+                        q->stats.total_time += current_entry->delay;
+                        q->stats.total_entries++;
                         q->e_current = 0;
                         q->stats.looped++;
+                        UPDATE_PRIV_LOCAL(q->e_head);
                         break;
                     case THEATERQ_CONT_CLEAN:
-                        WRITE_ONCE(current_entry, 
-                                  (struct theaterq_entry *) &theaterq_default_entry);
                         q->t_updated = THEATERQ_NO_EXPIRY;
                         q->e_current = 0;
                         q->t_busy_time = 0;
                         q->stage = THEATERQ_STAGE_FINISH;
+                        UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
                         goto leave_update_loop;
                     case THEATERQ_CONT_HOLD:
                         /* fallthrough */
@@ -777,11 +789,13 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             } else {
                 q->stats.total_time += current_entry->delay;
                 q->stats.total_entries++;
-                current_entry = current_entry->next;
                 q->e_current++;
+                UPDATE_PRIV_LOCAL(current_entry->next);
             }
         }
     }
+
+#undef UPDATE_PRIV_LOCAL
 
 leave_update_loop:
     delay = get_pkt_delay(current_entry->latency, 
@@ -1044,7 +1058,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
             q->t_busy_time = 0;
             new_stage = THEATERQ_STAGE_LOAD;
             q->deletion_pending = true;
-            start_replay = THEATERQ_REPLAY_STOP & THEATERQ_REPLAY_CLEAR;
+            start_replay = THEATERQ_REPLAY_STOP | THEATERQ_REPLAY_CLEAR;
         } else if (new_stage == THEATERQ_STAGE_LOAD && 
                    q->stage != new_stage) {
             start_replay = THEATERQ_REPLAY_STOP;
@@ -1096,7 +1110,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         && !theaterq_syncgroup_change(q, new_syncgrp))
             return -EBADE;
 
-    if (new_stage != THEATERQ_STAGE_UNSPEC) {
+    if (new_stage) {
         if (start_replay & THEATERQ_REPLAY_START) {
             theaterq_syncgroup_startall(q);
         } else if (start_replay & THEATERQ_REPLAY_STOP) {
@@ -1126,6 +1140,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
 
     sch->limit = __UINT32_MAX__;
 
+    q->parent = sch;
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
     q->ingest_mode = THEATERQ_INGEST_MODE_SIMPLE;
