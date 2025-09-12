@@ -70,12 +70,12 @@ struct theaterq_sched_data {
     struct rb_root t_root;
     struct sk_buff *t_head;
     struct sk_buff *t_tail;
+    spinlock_t t_lock;
     u64 t_busy_time;
 
     u32 t_len;
     u64 t_blen;
 
-    struct Qdisc *parent;
     struct Qdisc *qdisc;
     struct qdisc_watchdog watchdog;
 
@@ -390,6 +390,7 @@ static void edfq_reset(struct Qdisc *sch)
 // Always called under tree_lock.
 static void entry_list_clear(struct theaterq_sched_data *q)
 {
+    spin_lock_bh(&q->t_lock);
     struct theaterq_entry *e = q->e_head;
     struct theaterq_entry *next = NULL;
 
@@ -405,6 +406,7 @@ static void entry_list_clear(struct theaterq_sched_data *q)
     q->e_current = 0;
     q->e_entries = 0;
     q->deletion_pending = false;
+    spin_unlock_bh(&q->t_lock);
 }
 
 static void theaterq_stats_clear(struct tc_theaterq_xstats *stats)
@@ -618,12 +620,13 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 entry->dup_delay = dup_delay;
                 entry->next = NULL;
 
-                //sch_tree_lock(q->parent);
+                spin_lock_bh(&q->t_lock);
+
                 if (q->stage != THEATERQ_STAGE_LOAD || q->deletion_pending) {
                     printk(KERN_WARNING 
                            "sch_theaterq: Qdisc not in load stage, or deletion pending.\n");
-                    //sch_tree_unlock(q->parent);
-                    // TODO: kfree
+                    spin_unlock_bh(&q->t_lock);
+                    kmem_cache_free(theaterq_cache, entry);
                     return -EBUSY;
                 }
 
@@ -636,7 +639,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 }
 
                 q->e_entries++;
-                //sch_tree_unlock(q->parent);
+
+                spin_unlock_bh(&q->t_lock);
             }
         }
 
@@ -1140,7 +1144,6 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
 
     sch->limit = __UINT32_MAX__;
 
-    q->parent = sch;
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
     q->ingest_mode = THEATERQ_INGEST_MODE_SIMPLE;
@@ -1151,6 +1154,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
 
+    spin_lock_init(&q->t_lock);
     qdisc_watchdog_init(&q->watchdog, sch);
 
     if (!opt) return -EINVAL;
