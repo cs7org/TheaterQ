@@ -36,7 +36,7 @@
 // Slab allocator for Trace File entries of all instances
 static struct kmem_cache *theaterq_cache = NULL;
 
-// Lock for accessing syncgroup data accross multiple instances
+// Lock for accessing syncgroup data across multiple instances
 static DEFINE_SPINLOCK(theaterq_tree_lock);
 static u8 syngrps = 8;
 static u8 syngrps_members = 8;
@@ -137,7 +137,7 @@ struct theaterq_sched_data {
 //       - ...
 // 'members' is a short array with static size, every entry can be NULL
 // - insert: find first NULL entry and write
-// - find/remove: interate over all member fiels
+// - find/remove: iterate over all member fields
 // This data structures should only be accessed under theaterq_tree_lock
 struct theaterq_syngrp {
     u16 index;
@@ -413,7 +413,7 @@ static void edfq_reset(struct Qdisc *sch)
     q->t_blen = 0;
 }
 
-// Always called under tree_lock, also aquires the instance lock to
+// Always called under tree_lock, also acquires the instance lock to
 // prevent chardev insertion during clearing the list
 static void entry_list_clear(struct theaterq_sched_data *q)
 {
@@ -711,7 +711,7 @@ static int create_ingest_cdev(struct Qdisc *sch)
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
-    // Trace File name: theaterq:<IF_NAME>:<MAJOR>:<MINOR>
+    // Trace File ingest dev name: /dev/theaterq:<IF_NAME>:<MAJOR>:<MINOR>
     ret = snprintf(q->ingest_cdev.name, sizeof(q->ingest_cdev.name), 
             "theaterq:%s:%x:%x", 
             qdisc_dev(sch)->name, 
@@ -838,7 +838,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                         break;
                     case THEATERQ_CONT_CLEAN:
                         // THEATERQ_NO_EXPIRY: Static entry that will not
-                        // change any more, prevent futire list walks with
+                        // change anymore, prevent future list walks with
                         // possible u64 overflows
                         q->t_updated = THEATERQ_NO_EXPIRY;
                         q->e_current = 0;
@@ -847,7 +847,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                         UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
                         goto leave_update_loop;
                     case THEATERQ_CONT_HOLD:
-                        /* fallthrough */
+                        /* fall through */
                     default:
                         q->stage = THEATERQ_STAGE_FINISH;
                         q->t_updated = THEATERQ_NO_EXPIRY;
@@ -883,7 +883,7 @@ leave_update_loop:
     }
 
     if (current_entry->rate || current_entry->latency || current_entry->jitter) {
-            // Prevent feedback of delayed packets to upper layer of the
+            // Prevent feedback of delayed skbs to upper layer of the
             // network stack
             skb_orphan_partial(skb);
             orphaned = true;
@@ -922,8 +922,8 @@ leave_update_loop:
     cb->transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
     edfq_enqueue(skb, sch);
 
-    // The dequeue will be aware of some delayed packets in the EDFQ, but
-    // the enqueued packet could "overtake" already enqueued packets:
+    // The dequeue will be aware of some delayed skbs in the EDFQ, but
+    // the enqueued packet could "overtake" already enqueued skbs:
     // Check, if the dequeue must be called earlier by setting the hrtimer
     struct sk_buff *first = theaterq_peek(q);
     u64 first_send_time;
@@ -1039,11 +1039,11 @@ deliver:
 
     skb = theaterq_peek(q);
     if (skb) {
-        // Each enqueued skb has an earliest_send_time and a transmit_time.
+        // Each enqueued skb has an earliest_send_time and a transmit_time values.
         // For bandwidth limitations, the link is "busy" (t_busy_time) for the
-        // transmit_time after an skb was sent.
-        // The next skb deuqued is always the skb with the lowest 
-        // earliest_send_time, but it can only be send when:
+        // transmit_time after a skb was sent.
+        // The next skb dequeued is always the skb with the lowest 
+        // earliest_send_time, but it can only be sent when:
         // - earliest_send_time >= now and
         // - earliest_send_time >= t_busy_time
         // Otherwise: Delay the dequeue by setting the hrtimer
@@ -1067,7 +1067,7 @@ deliver:
 
                 // When a child qdisc is available: Enqueue there, don't send.
                 // skbs are enqueued to the child qdisc AFTER delay, queue
-                // limits and bandwith limitations are applied, thus this will
+                // limits and bandwidth limitations are applied, thus this will
                 // not be useful for AQM. skbs can be dropped during theaterq's
                 // enqueue function, not arriving here at all.
                 if (q->qdisc) {
@@ -1210,7 +1210,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
             return -EBADE;
     
     // Important: Do not try to lock the global lock while also holding
-    // the sch_tree_lock, a deadlock could occour.
+    // the sch_tree_lock, a deadlock could occur.
     if (new_stage) {
         if (start_replay & THEATERQ_REPLAY_START) {
             theaterq_syncgroup_startall(q);
@@ -1219,7 +1219,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         }
 
         // Delete the list under the sch_tree_lock again. The function
-        // will also aquire the list lock of this instance
+        // will also acquire the list lock of this instance
         if (start_replay & THEATERQ_REPLAY_CLEAR) {
             sch_tree_lock(sch);
             entry_list_clear(q);
@@ -1241,7 +1241,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
-    // We will manage our queue sizes ourself
+    // We will manage our queue sizes ourselves
     sch->limit = __UINT32_MAX__;
 
     // Setup the inital state
