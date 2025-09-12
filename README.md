@@ -25,14 +25,14 @@ TC_LIB_DIR=tclib tc qdisc [...]
 TheaterQ expects two Trace File line formats:
 ```
 # Simple:
-<DELAY>,<LATENCY>,<RATE>,<LOSS>,<LIMIT>\n
+<KEEP>,<LATENCY>,<RATE>,<LOSS>,<LIMIT>\n
 
 # Extended:
-<DELAY>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>\n
+<KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>\n
 ```
 Types are identical in both formats. Default format is `SIMPLE`, during creation of a TheaterQ qdic instance the format can be set to `EXTENDED` by using the `ingest EXTENDED` option.
 
-- **`DELAY`**: Delay after which this line is activated in µs. The first entry must have a delay of 0.
+- **`KEEP`**: The time in µs how long this entry is kept active before continuing with the next Trace File entry. Entries with 0 time or large values (>= U64_MAX / 1000) are not allowed.
 - **`LATENCY`** and **`JITTER`**: Packet delay latency in ns.
 - **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format).
@@ -40,7 +40,7 @@ Types are identical in both formats. Default format is `SIMPLE`, during creation
 - **`DUP_PROB`** and **`DUP_DELAY`**: Probability for a packet to be duplicated, as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format). The duplicate will be statically delayed **`DUP_DELAY`** ns. A duplicated packet processed like any other, thus it is additionally affected by the `DELAY` and `JITTER`.
 
 On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
-Please note that rapid changes of the `DELAY` values or high `JITTER` values will lead to implicit packet reordering.
+Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering.
 
 ## Usage
 Install the kernel module and set `TC_LIB_DIR`:

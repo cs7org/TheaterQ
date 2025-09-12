@@ -3,7 +3,7 @@
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
-EXTRA_CFLAGS = -I$(PWD)/include
+EXTRA_CFLAGS = -I$(PWD)/include -Werror
 obj-m += sch_theaterq.o
 ccflags-y += -I$(PWD)/include
 
