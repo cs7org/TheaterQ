@@ -30,6 +30,7 @@
 
 #define THEATERQ_INGEST_MAXLEN 256
 #define THEATERQ_NO_SYNCGRP_SELECTED -2
+#define THEATERQ_NS_PER_US 1000
 
 static struct kmem_cache *theaterq_cache = NULL;
 static DEFINE_SPINLOCK(theaterq_tree_lock);
@@ -37,6 +38,7 @@ static u8 syngrps = 8;
 static u8 syngrps_members = 8;
 
 static const struct theaterq_entry theaterq_default_entry = {
+    .delay = U64_MAX,
     .latency = 0ULL,
     .jitter = 0ULL,
     .rate = 0ULL,
@@ -53,8 +55,10 @@ enum {
 };
 
 enum {
-    THEATERQ_HRTIMER_STOPPED,
-    THEATERQ_HRTIMER_RUNNING,
+    THEATERQ_REPLAY_UNCHANGED = 0,
+    THEATERQ_REPLAY_STOP = 1,
+    THEATERQ_REPLAY_START = 3,
+    THEATERQ_REPLAY_CLEAR = 4,
 };
 
 // Forward declaration
@@ -88,6 +92,8 @@ struct theaterq_sched_data {
     bool use_byte_queue;
     bool allow_gso;
     bool enable_ecn;
+
+    bool deletion_pending;
     struct theaterq_entry *current_entry;
     struct theaterq_entry *e_head;
     struct theaterq_entry *e_tail;
@@ -108,10 +114,8 @@ struct theaterq_sched_data {
         char lbuf[THEATERQ_INGEST_MAXLEN];
         size_t lpos;
     } ingest_helper;
-    
-    atomic_t t_running;
-    u64 t_started;
-    struct hrtimer timer;
+
+    u64 t_updated;
     struct theaterq_syngrp *syngrp;
     struct tc_theaterq_xstats stats;
 };
@@ -131,38 +135,39 @@ struct theaterq_skb_cb {
 // SYNC GROUPS =================================================================
 
 // Forward delcarations
-static void theaterq_stop_hrtimer(struct theaterq_sched_data *, bool, bool);
-static int theaterq_run_hrtimer(struct theaterq_sched_data *, bool);
 static void entry_list_clear(struct theaterq_sched_data *);
 static struct sk_buff *theaterq_peek(struct theaterq_sched_data *);
+static void theaterq_stop_replay(struct theaterq_sched_data *q);
+static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now);
 
-static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q, 
-                                       bool clear_others)
+static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q,
+                                       u32 own_newstage)
 {
     spin_lock_bh(&theaterq_tree_lock);
 
-    if (!q->syngrp)
+    q->stage = own_newstage;
+
+    if (!q->syngrp) {
+        theaterq_stop_replay(q);
         goto unlock;
+    }
 
     u32 group = q->syngrp->index;
 
     for (int i = 0; i < syngrps_members; i++) {
-        if (theaterq_syngrps[group].members[i] == NULL ||
-            theaterq_syngrps[group].members[i] == q)
+        if (theaterq_syngrps[group].members[i] == NULL)
                 continue;
         
-        struct theaterq_sched_data *other = theaterq_syngrps[group].members[i];
-        if (other->stage != THEATERQ_STAGE_ARM && 
-            other->stage != THEATERQ_STAGE_RUN && 
-            other->stage != THEATERQ_STAGE_FINISH)
+        struct theaterq_sched_data *instance = theaterq_syngrps[group].members[i];
+        if (instance->stage != THEATERQ_STAGE_ARM && 
+            instance->stage != THEATERQ_STAGE_RUN && 
+            instance->stage != THEATERQ_STAGE_FINISH)
                 continue;
-        
-        theaterq_stop_hrtimer(other, false, false);
-        if (clear_others)
-            entry_list_clear(q);
 
-        other->stage = THEATERQ_STAGE_LOAD;
+        theaterq_stop_replay(instance);
 
+        if (instance != q)
+            instance->stage = THEATERQ_STAGE_LOAD;
     }
 
 unlock:
@@ -171,34 +176,33 @@ unlock:
 
 static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
 {
+    u64 now = ktime_get_ns();
     spin_lock_bh(&theaterq_tree_lock);
 
     if (!q->syngrp) {
-        spin_unlock_bh(&theaterq_tree_lock);
-        return;
+        theaterq_start_replay(q, now);
+        goto unlock;
     }
 
     u32 grp = q->syngrp->index;
 
     for (int i = 0; i < syngrps_members; i++) {
-        if (theaterq_syngrps[grp].members[i] == NULL ||
-            theaterq_syngrps[grp].members[i] == q)
+        if (theaterq_syngrps[grp].members[i] == NULL)
                 continue;
         
-        struct theaterq_sched_data *other = theaterq_syngrps[grp].members[i];
-        if (other->stage != THEATERQ_STAGE_LOAD && 
-            other->stage != THEATERQ_STAGE_FINISH &&
-            other->stage != THEATERQ_STAGE_ARM)
+        struct theaterq_sched_data *instance = theaterq_syngrps[grp].members[i];
+        if (instance->stage != THEATERQ_STAGE_LOAD && 
+            instance->stage != THEATERQ_STAGE_FINISH &&
+            instance->stage != THEATERQ_STAGE_ARM)
                 continue;
-        
-        int errno = theaterq_run_hrtimer(other, false);
+
+        int errno = theaterq_start_replay(instance, now);
         if (errno)
             printk(KERN_WARNING "theaterq: Unable to start member %i in "
                                 "syngroup %d: %d\n", i, grp, errno);
     }
 
-    q->stage = THEATERQ_STAGE_LOAD;
-
+unlock:
     spin_unlock_bh(&theaterq_tree_lock);
 }
 
@@ -377,6 +381,7 @@ static void edfq_reset(struct Qdisc *sch)
     q->t_blen = 0;
 }
 
+// Always called under tree_lock.
 static void entry_list_clear(struct theaterq_sched_data *q)
 {
     struct theaterq_entry *e = q->e_head;
@@ -392,6 +397,7 @@ static void entry_list_clear(struct theaterq_sched_data *q)
     q->e_tail = NULL;
     q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
     q->e_entries = 0;
+    q->deletion_pending = false;
 }
 
 static void theaterq_stats_clear(struct tc_theaterq_xstats *stats)
@@ -401,70 +407,33 @@ static void theaterq_stats_clear(struct tc_theaterq_xstats *stats)
     stats->total_entries = 0;
 }
 
-static int theaterq_run_hrtimer(struct theaterq_sched_data *q, 
-                                bool group_members)
+// Always called under global lock.
+static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
 {
-    int ret = 0;
-
-    if (group_members)
-        theaterq_syncgroup_startall(q);
-
-    if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_STOPPED, 
-                       THEATERQ_HRTIMER_RUNNING))
-        return ret;
-    
-    if (!group_members) {
-        q->stage = THEATERQ_STAGE_RUN;
-    } else {
-        spin_lock_bh(&theaterq_tree_lock);
-        q->stage = THEATERQ_STAGE_RUN;
-        spin_unlock_bh(&theaterq_tree_lock);
-    }
-
     if (!q->e_head) {
-        ret = -EINVAL;
-        goto fail_reset;
+        q->stage = THEATERQ_STAGE_LOAD;
+        q->t_updated = U64_MAX;
+         WRITE_ONCE(q->current_entry, 
+              (struct theaterq_entry *) &theaterq_default_entry);
+        return -EINVAL;
     }
-
-    WRITE_ONCE(q->current_entry, q->e_head);
-    q->current_entry = q->e_head;
+    
     q->e_current = 0;
     q->t_busy_time = 0;
+    q->stage = THEATERQ_STAGE_RUN;
+    q->t_updated = now;
+    WRITE_ONCE(q->current_entry, q->e_head);
 
-    if (!q->current_entry->next) {
-        ret = -EINVAL;
-        goto fail_reset;
-    }
-
-    q->stats.total_time = q->current_entry->next->delay;
-    q->stats.total_entries++;
-    q->t_started = ktime_get_ns();
-    ktime_t delay = ktime_set(0, q->t_started + q->stats.total_time);
-
-    hrtimer_start(&q->timer, delay, HRTIMER_MODE_ABS);
-    return ret;
-
-fail_reset:
-    atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
-    q->stage = THEATERQ_STAGE_LOAD;
-    q->current_entry = (struct theaterq_entry *) &theaterq_default_entry;
-    return ret;
+    return 0;
 }
 
-static void theaterq_stop_hrtimer(struct theaterq_sched_data *q, 
-                                  bool group_members, bool clear_members)
+// Always called under global lock.
+// Stage transition not handled here.
+static void theaterq_stop_replay(struct theaterq_sched_data *q)
 {
-    if (group_members)
-        theaterq_syncgroup_stopall(q, clear_members);
-
-    if (atomic_cmpxchg(&q->t_running, THEATERQ_HRTIMER_RUNNING, 
-                       THEATERQ_HRTIMER_STOPPED))
-        return;
-
-    hrtimer_cancel(&q->timer);
-
     WRITE_ONCE(q->current_entry, 
               (struct theaterq_entry *) &theaterq_default_entry);
+    q->t_updated = U64_MAX;
 }
 
 // CHARDEV OPS =================================================================
@@ -611,15 +580,23 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
 
                 q->ingest_helper.lpos = 0;
 
-                if (q->e_head == NULL && delay != 0) {
+                // TODO: Document semantic change!
+                if (delay == 0) {
                     printk(KERN_WARNING 
-                           "sch_theaterq: First loaded entry needs a delay of 0\n");
+                           "sch_theaterq: Zero delay values are not allowed!\n");
                     return -EINVAL;
                 }
 
-                if (q->stage != THEATERQ_STAGE_LOAD) {
+                if (delay >= U64_MAX / THEATERQ_NS_PER_US) {
                     printk(KERN_WARNING 
-                           "sch_theaterq: Qdisc not in load stage\n");
+                           "sch_theaterq: Delay value too large, max is %lld!\n",
+                            (U64_MAX / THEATERQ_NS_PER_US) - 1);
+                    return -EINVAL;
+                }
+
+                if (q->stage != THEATERQ_STAGE_LOAD || q->deletion_pending) {
+                    printk(KERN_WARNING 
+                           "sch_theaterq: Qdisc not in load stage, or deletion pending.\n");
                     return -EBUSY;
                 }
 
@@ -630,7 +607,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     return -ENOMEM;
                 }
 
-                entry->delay = delay * 1000; // µs -> ns 
+                entry->delay = delay * THEATERQ_NS_PER_US; // µs -> ns 
                 entry->latency = latency;
                 entry->jitter = jitter;
                 entry->rate = rate / 8; // bits per second -> byte per second
@@ -742,66 +719,6 @@ static int destroy_ingest_cdev(struct Qdisc *sch)
 
 // QDISC OPS ===================================================================
 
-static enum hrtimer_restart theaterq_timer_cb(struct hrtimer *timer)
-{
-    struct theaterq_sched_data *q = container_of(timer, 
-                                        struct theaterq_sched_data, timer);
-    s64 next_delay;
-
-    if (atomic_read(&q->t_running) != THEATERQ_HRTIMER_RUNNING)
-        return HRTIMER_NORESTART;
-
-    if (!q->current_entry->next) {
-        switch (q->cont_mode) {
-            case THEATERQ_CONT_LOOP:
-                q->e_current = 0;
-                q->stats.looped++;
-                WRITE_ONCE(q->current_entry, q->e_head);
-                break;
-
-            case THEATERQ_CONT_CLEAN:
-                WRITE_ONCE(q->current_entry, 
-                           (struct theaterq_entry *) &theaterq_default_entry);
-
-                // No fallthrough, gcc does not allow it after WRITE_ONCE
-                WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
-                atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
-                q->e_current = 0;
-                q->t_busy_time = 0;
-                return HRTIMER_NORESTART;
-
-            case THEATERQ_CONT_HOLD:
-                /* fallthrough */
-            default:
-                WRITE_ONCE(q->stage, THEATERQ_STAGE_FINISH);
-                q->e_current = 0;
-                return HRTIMER_NORESTART;
-        }
-    } else {
-        WRITE_ONCE(q->current_entry, q->current_entry->next);
-        q->e_current++;
-    }
-
-    if (q->current_entry->next)
-        next_delay = q->current_entry->next->delay;
-    else
-        next_delay = q->current_entry->delay;
-
-    u64 t_should = q->t_started + q->stats.total_time;
-    u64 now = ktime_get_ns();
-    if (t_should < now && printk_ratelimit()) {
-        printk(KERN_WARNING "theaterq: hrtimer is lagging behind, "
-               "%lldns\n", (now - t_should));
-        q->stats.total_time += now - t_should;
-    }
-
-    q->stats.total_entries++;
-    q->stats.total_time += (u64) next_delay;
-
-    hrtimer_forward_now(timer, ktime_set(0, (u64) next_delay));
-    return HRTIMER_RESTART;
-}
-
 static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                                 struct sk_buff **to_free)
 {
@@ -810,19 +727,61 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     struct sk_buff *dup_skb;
 
     if (READ_ONCE(q->stage) == THEATERQ_STAGE_ARM) {
-        (void) theaterq_run_hrtimer(q, true);
+        (void) theaterq_start_replay(q, true);
     }
 
     struct theaterq_entry *current_entry = READ_ONCE(q->current_entry);
+
+    // Failsave. This should never happen.
+    if (unlikely(!current_entry))
+        WRITE_ONCE(current_entry, 
+                  (struct theaterq_entry *) &theaterq_default_entry);
+
     s64 now = ktime_get_ns();
     s64 delay = 0;
     u64 check_len;
     bool orphaned = false;
 
-    if (current_entry)
-        delay = get_pkt_delay(current_entry->latency, 
-                              current_entry->jitter,
-                              &q->prng);
+    if (unlikely(current_entry->delay != U64_MAX && 
+                 q->t_updated + current_entry->delay <= now)) {
+        while (now - q->t_updated >= current_entry->delay) {
+            q->t_updated += current_entry->delay;
+
+            if (!current_entry->next) {
+                switch (q->cont_mode) {
+                    case THEATERQ_CONT_LOOP:
+                        WRITE_ONCE(q->current_entry, q->e_head);
+                        q->e_current = 0;
+                        q->stats.looped++;
+                        break;
+                    case THEATERQ_CONT_CLEAN:
+                        WRITE_ONCE(current_entry, 
+                                  (struct theaterq_entry *) &theaterq_default_entry);
+                        q->t_updated = U64_MAX;
+                        q->e_current = 0;
+                        q->t_busy_time = 0;
+                        q->stage = THEATERQ_STAGE_FINISH;
+                        goto leave_update_loop;
+                    case THEATERQ_CONT_HOLD:
+                        /* fallthrough */
+                    default:
+                        q->stage = THEATERQ_STAGE_FINISH;
+                        q->t_updated = U64_MAX;
+                        goto leave_update_loop;
+                }
+            } else {
+                q->stats.total_time += current_entry->delay;
+                q->stats.total_entries++;
+                current_entry = current_entry->next;
+                q->e_current++;
+            }
+        }
+    }
+
+leave_update_loop:
+    delay = get_pkt_delay(current_entry->latency, 
+                          current_entry->jitter,
+                          &q->prng);
     skb->prev = NULL;
 
     if (loss_event(q)) {
@@ -831,8 +790,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
 
-    if (current_entry && 
-        (current_entry->rate || current_entry->latency || current_entry->jitter)) {
+    if (current_entry->rate || current_entry->latency || current_entry->jitter) {
             skb_orphan_partial(skb);
             orphaned = true;
     }
@@ -854,10 +812,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     check_len = q->use_byte_queue ? 
                     q->t_blen + qdisc_pkt_len(skb) : q->t_len;
 
-    if (unlikely(current_entry && 
-                 current_entry->limit && 
-                 check_len >= current_entry->limit)) {
-        
+    if (unlikely(current_entry->limit && check_len >= current_entry->limit)) {
         if (q->enable_ecn)
             INET_ECN_set_ce(skb);
 
@@ -1059,7 +1014,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct nlattr *tb[TCA_THEATERQ_MAX + 1];
-    int run_hrtimer = 0;
+    int start_replay = THEATERQ_REPLAY_UNCHANGED;
     int ret;
     u32 new_stage = THEATERQ_STAGE_UNSPEC;
     s32 new_syncgrp = THEATERQ_NO_SYNCGRP_SELECTED;
@@ -1070,6 +1025,9 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
         return ret;
     }
 
+    if (q->deletion_pending)
+        return -EBUSY;
+
     sch_tree_lock(sch);
     if (tb[TCA_THEATERQ_STAGE]) {
         new_stage = nla_get_u32(tb[TCA_THEATERQ_STAGE]);
@@ -1078,13 +1036,13 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
             new_stage = THEATERQ_STAGE_LOAD;
 
         if (new_stage == THEATERQ_STAGE_CLEAR) {
-            theaterq_stop_hrtimer(q, true, true);
             q->t_busy_time = 0;
-            entry_list_clear(q);
             new_stage = THEATERQ_STAGE_LOAD;
+            q->deletion_pending = true;
+            start_replay = THEATERQ_REPLAY_STOP & THEATERQ_REPLAY_CLEAR;
         } else if (new_stage == THEATERQ_STAGE_LOAD && 
                    q->stage != new_stage) {
-            theaterq_stop_hrtimer(q, true, false);
+            start_replay = THEATERQ_REPLAY_STOP;
         } else if (new_stage == THEATERQ_STAGE_RUN) {
             if (!q->e_entries) {
                 ret = -ENODATA;
@@ -1093,7 +1051,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
                 goto err_out;
             }
 
-            run_hrtimer = 1;
+            start_replay = THEATERQ_REPLAY_START;
         }
     }
 
@@ -1129,18 +1087,25 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 
     sch_tree_unlock(sch);
 
-    if (new_stage != THEATERQ_STAGE_UNSPEC) {
-        spin_lock_bh(&theaterq_tree_lock);
-        q->stage = new_stage;
-        spin_unlock_bh(&theaterq_tree_lock);
-    }
-
     if (new_syncgrp != THEATERQ_NO_SYNCGRP_SELECTED 
         && !theaterq_syncgroup_change(q, new_syncgrp))
             return -EBADE;
 
-    if (run_hrtimer)
-        ret = theaterq_run_hrtimer(q, true);
+    if (new_stage != THEATERQ_STAGE_UNSPEC) {
+        if (start_replay & THEATERQ_REPLAY_START) {
+            theaterq_syncgroup_startall(q);
+        } else if (start_replay & THEATERQ_REPLAY_STOP) {
+            theaterq_syncgroup_stopall(q, new_stage);
+        }
+
+        if (start_replay & THEATERQ_REPLAY_CLEAR) {
+            sch_tree_lock(sch);
+            entry_list_clear(q);
+            sch_tree_unlock(sch);
+
+        }
+    }
+
     return ret;
 
 err_out:
@@ -1163,6 +1128,8 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->syngrp = NULL;
     q->isdup = false;
     q->t_busy_time = 0ULL;
+    q->t_updated = 0ULL;
+    q->deletion_pending = false;
 
     qdisc_watchdog_init(&q->watchdog, sch);
 
@@ -1173,10 +1140,6 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     if (ret < 0) return ret;
 
     entry_list_clear(q);
-
-    hrtimer_init(&q->timer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
-    q->timer.function = theaterq_timer_cb;
-    atomic_set(&q->t_running, THEATERQ_HRTIMER_STOPPED);
 
     ret = theaterq_change(sch, opt, extack);
     if (ret)
@@ -1191,8 +1154,9 @@ static void theaterq_reset(struct Qdisc *sch)
 
     qdisc_reset_queue(sch);
     edfq_reset(sch);
-    theaterq_stop_hrtimer(q, false, false);
     theaterq_syncgroup_leave(q);
+    theaterq_stop_replay(q);
+    q->stage = THEATERQ_STAGE_LOAD;
     theaterq_stats_clear(&q->stats);
     q->t_busy_time = 0;
     if (q->qdisc) qdisc_reset(q->qdisc);
@@ -1202,8 +1166,6 @@ static void theaterq_reset(struct Qdisc *sch)
 static void theaterq_destroy(struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
-
-    theaterq_stop_hrtimer(q, false, false);
     qdisc_watchdog_cancel(&q->watchdog);
     theaterq_syncgroup_leave(q);
     destroy_ingest_cdev(sch);
