@@ -193,6 +193,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     __u32 syncgroup = -1;
     __u64 entry_count = 0;
     __u64 entry_pos = 0;
+    __u64 time_total = 0;
+    __u64 time_progress = 0;
     struct theaterq_entry *entry_current = NULL;
     char *ingest_cdev = NULL;
     char cdev_buf[THEATERQ_CDEV_MAX_NAMELEN + sizeof(THEATERQ_CDEV_PREFIX)] = {};
@@ -223,7 +225,9 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
     SET_GETATTR_VALUE(pkt_overhead, TCA_THEATERQ_PKT_OVERHEAD, rta_getattr_s32);
     SET_GETATTR_VALUE(syncgroup, TCA_THEATERQ_SYNCGRP, rta_getattr_s32);
     SET_GETATTR_VALUE(entry_count, TCA_THEATERQ_ENTRY_LEN, rta_getattr_u64);
+    SET_GETATTR_VALUE(time_total, TCA_THEATERQ_TIME_LEN, rta_getattr_u64);
     SET_GETATTR_VALUE(entry_pos, TCA_THEATERQ_ENTRY_POS, rta_getattr_u64);
+    SET_GETATTR_VALUE(time_progress, TCA_THEATERQ_TIME_PROGRESS, rta_getattr_u64);
 
 #undef SET_GETATTR_VALUE
 
@@ -308,9 +312,15 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
 
     if (present[TCA_THEATERQ_ENTRY_LEN])
         print_u64(PRINT_ANY, "entries", " entries %llu", entry_count);
-    
+
+    if (present[TCA_THEATERQ_TIME_LEN])
+        print_u64(PRINT_ANY, "entries_time", " entries_time %llu", time_total);
+
     if (present[TCA_THEATERQ_ENTRY_POS])
         print_u64(PRINT_ANY, "position", " position %llu", entry_pos);
+
+    if (present[TCA_THEATERQ_TIME_PROGRESS])
+        print_u64(PRINT_ANY, "position_time", " position_time %llu", time_progress);
 
     if (present[TCA_THEATERQ_ENTRY_CURRENT]) {
         open_json_object("current");
