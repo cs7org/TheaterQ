@@ -108,6 +108,7 @@ struct theaterq_sched_data {
     u64 e_current;
     u64 e_totaltime;
     u64 e_progresstime;
+    u64 q;
 
     struct ingest_cdev {
         char name[THEATERQ_CDEV_MAX_NAMELEN];
@@ -157,7 +158,7 @@ struct theaterq_skb_cb {
 
 // SYNC GROUPS =================================================================
 
-// Forward delcarations
+// Forward declarations
 static void entry_list_clear(struct theaterq_sched_data *);
 static struct sk_buff *theaterq_peek(struct theaterq_sched_data *);
 static void theaterq_stop_replay(struct theaterq_sched_data *q);
@@ -814,9 +815,11 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     u64 check_len;
     bool orphaned = false;
 
+    q->q++;
+
 #define UPDATE_PRIV_LOCAL(new) do { \
                             WRITE_ONCE(q->current_entry, new); \
-                            current_entry = q->current_entry; \
+                            current_entry = new; \
                         } while (0)
     
     // Check if the current_entry is still valid or if the pointer needs
@@ -825,8 +828,8 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                  q->t_updated + current_entry->delay <= now)) {
 
         // Shortcut for loop cont mode: When the list walk would run over
-        // the start of the list (mutiple times), we just set our pointer 
-        // to the begin of the list before entering the list walk,
+        // the start of the list (multiple times), we just set our pointer 
+        // to the beginning of the list before entering the list walk,
         // thus shortcutting whole list walks during low packet load and/or
         // high update rates
         u64 time_since_update = now - q->t_updated;
@@ -834,7 +837,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             time_since_update >= q->e_totaltime - q->e_progresstime) {
             
             u64 full_loops = time_since_update / q->e_totaltime;
-            
+
             if (full_loops >= 1) {
                 q->stats.looped += full_loops;
                 q->stats.total_time += full_loops * q->e_totaltime;
@@ -842,11 +845,6 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                 q->t_updated += full_loops * q->e_totaltime;
             }
 
-            q->stats.looped++;
-            q->stats.total_time += q->e_totaltime - q->e_progresstime;
-            q->stats.total_entries += q->e_entries - q->e_current;
-
-            q->t_updated += q->e_totaltime - q->e_progresstime;
             q->e_current = 0;
             q->e_progresstime = 0;
             UPDATE_PRIV_LOCAL(q->e_head);
@@ -860,9 +858,9 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             q->t_updated += current_entry->delay;
             q->e_progresstime += current_entry->delay;
 
-            // No more list entries are available. cont_mode will define
-            // how to continue.
             if (!current_entry->next) {
+                // No more list entries are available. cont_mode will 
+                // define how to continue.
                 switch (q->cont_mode) {
                     case THEATERQ_CONT_LOOP:
                         q->stats.total_time += current_entry->delay;
@@ -985,7 +983,7 @@ static int theaterq_enqueue_gso(struct sk_buff *skb, struct Qdisc *sch,
     int ret = NET_XMIT_SUCCESS;
     int flag = 0;
 
-    // Segment a GSO packet to segments = Layer 2 ethernet packets
+    // Segment a GSO packet to segments = Layer 2 Ethernet packets
     // Heavily inspired from sch_tbf's segmentation implementation
     netdev_features_t features = netif_skb_features(skb);
     struct sk_buff *segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
