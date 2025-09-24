@@ -1,4 +1,9 @@
-# TheaterQ: Kernel Module for Trace File based Link Emulation
+# TheaterQ: Kernel Module for Dynamic Link Emulation
+
+TheaterQ provides a qdisc for network emulation.
+It can introduce different link impairments, e.g., bandwidth bottlenecks, delays, packet drops or packet reordering.
+In difference to *NetEm*, these impairments can be configured with changes over time using Trace Files in a CSV format.
+Therefore, it can be used to emulate networks links or paths with dynamic characteristics.
 
 ## Kernel Module
 Build & Install:
@@ -30,10 +35,12 @@ TheaterQ expects two Trace File line formats:
 # Extended:
 <KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>\n
 ```
-Types are identical in both formats. Default format is `SIMPLE`, during creation of a TheaterQ qdic instance the format can be set to `EXTENDED` by using the `ingest EXTENDED` option.
+Types are identical in both formats. 
+Default format is `SIMPLE`, during creation of a TheaterQ qdisc instance the format can be set to `EXTENDED` by using the `ingest EXTENDED` option.
+Lines starting with a non-numeric character are ignored.
 
 - **`KEEP`**: The time in µs how long this entry is kept active before continuing with the next Trace File entry. Entries with 0 time or large values (>= U64_MAX / 1000) are not allowed.
-- **`LATENCY`** and **`JITTER`**: Packet delay latency in ns.
+- **`LATENCY`** and **`JITTER`**: Packet delay latency in ns with standard deviation.
 - **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format).
 - **`LIMIT`**: Currently available queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue.
@@ -60,7 +67,7 @@ TheaterQ is used in the following way:
    ```bash
    cat tracefile > /dev/theaterq:<oif>:<major>:0
    ```
-3. Start the Trace File Playback. Once started, the character device no longer accepts new inputs.
+3. Start the Trace File playback. Once started, the character device no longer accepts new inputs.
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage {ARM|RUN} cont {LOOP|CLEAR|HOLD}
    ```
@@ -78,10 +85,10 @@ TheaterQ is used in the following way:
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage CLEAR
    ```
-   In both cases the Trace File Replay is stopped.
+   In both cases the Trace File replay is stopped.
 
 ### Syncgroups
-Multiple TheaterQ qdisc instances can be added to syncgroups, e.g. to sync the Trace File replay between a forward and return link. Use the following workflow:
+Multiple TheaterQ qdisc instances can be added to syncgroups, e.g. to sync the Trace File replay between a forward and return link interface. Use the following workflow:
 1. Create both qdiscs on different interfaces but add the `syncgroup <group>` option. All qdiscs with the same syncgroup number will be started synchronously. With default settings, 8 syncgroups are available (0-7), while each group can have up to 8 members. To add a syncgroup, they have to be in stage `LOAD`, `ARM` or `FINISH`.
 2. Load the Trace Files. Note: Trace files can have different entries and lengths, just the start point is synchronized between the groups.
 3. Setting one qdisc to the `RUN` stage will set all the other to `RUN`, whenever possible (e.g. a Trace File was ingested, and they are in a suitable stage).

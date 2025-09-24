@@ -38,8 +38,8 @@ static struct kmem_cache *theaterq_cache = NULL;
 
 // Lock for accessing syncgroup data across multiple instances
 static DEFINE_SPINLOCK(theaterq_tree_lock);
-static u8 syngrps = 8;
-static u8 syngrps_members = 8;
+static u8 syncgrps = 8;
+static u8 syncgrps_members = 8;
 
 static const struct theaterq_entry theaterq_default_entry = {
     .delay = THEATERQ_NO_EXPIRY,
@@ -66,7 +66,7 @@ enum {
 };
 
 // Forward declaration
-struct theaterq_syngrp;
+struct theaterq_syncgrp;
 
 struct theaterq_sched_data {
     // Earliest Deadline First skb Dequeue
@@ -108,7 +108,6 @@ struct theaterq_sched_data {
     u64 e_current;
     u64 e_totaltime;
     u64 e_progresstime;
-    u64 q;
 
     struct ingest_cdev {
         char name[THEATERQ_CDEV_MAX_NAMELEN];
@@ -127,27 +126,27 @@ struct theaterq_sched_data {
 
     u64 t_updated;
 
-    // Referencing back to the theaterq_syngrps[] entry.
+    // Referencing back to the theaterq_syncgrps[] entry.
     // NULL = not a member of any snycgroup
-    struct theaterq_syngrp *syngrp;
+    struct theaterq_syncgrp *syncgrp;
     struct tc_theaterq_xstats stats;
 };
 
 // Syncgroup data structures:
-// theaterq_syngrps[syngrps]:
-//       - [0] -> 0, members[syngrps_members]
-//       - [1] -> 1, members[syngrps_members]
+// theaterq_syncgrps[syncgrps]:
+//       - [0] -> 0, members[syncgrps_members]
+//       - [1] -> 1, members[syncgrps_members]
 //       - ...
 // 'members' is a short array with static size, every entry can be NULL
 // - insert: find first NULL entry and write
 // - find/remove: iterate over all member fields
 // This data structures should only be accessed under theaterq_tree_lock
-struct theaterq_syngrp {
+struct theaterq_syncgrp {
     u16 index;
     struct theaterq_sched_data **members;
 };
 
-static struct theaterq_syngrp *theaterq_syngrps = NULL;
+static struct theaterq_syncgrp *theaterq_syncgrps = NULL;
 
 struct theaterq_skb_cb {
     // Send time of a packet: arrive_time + delays, used for EDFQ sorting
@@ -170,20 +169,20 @@ static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q,
     spin_lock_bh(&theaterq_tree_lock);
 
     // If no syncgroup is set: Just stop own instance
-    if (!q->syngrp) {
+    if (!q->syncgrp) {
         theaterq_stop_replay(q);
         q->stage = own_newstage;
         goto unlock;
     }
 
-    u32 group = q->syngrp->index;
+    u32 group = q->syncgrp->index;
 
-    for (int i = 0; i < syngrps_members; i++) {
-        if (theaterq_syngrps[group].members[i] == NULL)
+    for (int i = 0; i < syncgrps_members; i++) {
+        if (theaterq_syncgrps[group].members[i] == NULL)
                 continue;
         
         // Stop all instances in correct stage
-        struct theaterq_sched_data *instance = theaterq_syngrps[group].members[i];
+        struct theaterq_sched_data *instance = theaterq_syncgrps[group].members[i];
         if (instance->stage != THEATERQ_STAGE_ARM && 
             instance->stage != THEATERQ_STAGE_RUN && 
             instance->stage != THEATERQ_STAGE_FINISH)
@@ -207,7 +206,7 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
     spin_lock_bh(&theaterq_tree_lock);
 
     // If no syncgroup is set: Just start own instance
-    if (!q->syngrp) {
+    if (!q->syncgrp) {
         if (q->stage == THEATERQ_STAGE_LOAD ||
             q->stage == THEATERQ_STAGE_FINISH ||
             q->stage == THEATERQ_STAGE_ARM)
@@ -216,14 +215,14 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
         goto unlock;
     }
 
-    u32 grp = q->syngrp->index;
+    u32 grp = q->syncgrp->index;
 
-    for (int i = 0; i < syngrps_members; i++) {
-        if (theaterq_syngrps[grp].members[i] == NULL)
+    for (int i = 0; i < syncgrps_members; i++) {
+        if (theaterq_syncgrps[grp].members[i] == NULL)
                 continue;
         
         // Start all instances that are in correct stage
-        struct theaterq_sched_data *instance = theaterq_syngrps[grp].members[i];
+        struct theaterq_sched_data *instance = theaterq_syncgrps[grp].members[i];
         if (instance->stage != THEATERQ_STAGE_LOAD && 
             instance->stage != THEATERQ_STAGE_FINISH &&
             instance->stage != THEATERQ_STAGE_ARM)
@@ -232,7 +231,7 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
         int errno = theaterq_start_replay(instance, now);
         if (errno)
             printk(KERN_WARNING "theaterq: Unable to start member %i in "
-                                "syngroup %d: %d\n", i, grp, errno);
+                                "syncgroup %d: %d\n", i, grp, errno);
     }
 
 unlock:
@@ -250,9 +249,9 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
         return false;
     }
 
-    if (grp >= syngrps) {
+    if (grp >= syncgrps) {
         printk(KERN_WARNING "theaterq: Maximum syncgroup index is %d\n", 
-               syngrps - 1);
+               syncgrps - 1);
         return false;
     }
 
@@ -260,12 +259,12 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
 
     int free_index = -1;
 
-    for (int i = 0; i < syngrps_members; i++) {
-        if (theaterq_syngrps[grp].members[i] == NULL) {
+    for (int i = 0; i < syncgrps_members; i++) {
+        if (theaterq_syncgrps[grp].members[i] == NULL) {
             if (free_index == -1)
                 free_index = i;
         } else {
-            u32 otherstage = theaterq_syngrps[grp].members[i]->stage;
+            u32 otherstage = theaterq_syncgrps[grp].members[i]->stage;
             if (otherstage != THEATERQ_STAGE_LOAD && otherstage != THEATERQ_STAGE_FINISH) {
                 printk(KERN_WARNING "theaterq: Cannot join a syncgroup with "
                                     "running/armed members\n");
@@ -279,8 +278,8 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
         goto fail_unlock;
     }
 
-    theaterq_syngrps[grp].members[free_index] = q;
-    q->syngrp = &theaterq_syngrps[grp];
+    theaterq_syncgrps[grp].members[free_index] = q;
+    q->syncgrp = &theaterq_syncgrps[grp];
     spin_unlock_bh(&theaterq_tree_lock);
     return true;
 
@@ -293,17 +292,17 @@ static void theaterq_syncgroup_leave(struct theaterq_sched_data *q)
 {
     spin_lock_bh(&theaterq_tree_lock);
 
-    if (!q->syngrp)
+    if (!q->syncgrp)
         goto unlock;
     
-    for (int i = 0; i < syngrps_members; i++) {
-        if (theaterq_syngrps[q->syngrp->index].members[i] == q) {
-            theaterq_syngrps[q->syngrp->index].members[i] = NULL;
+    for (int i = 0; i < syncgrps_members; i++) {
+        if (theaterq_syncgrps[q->syncgrp->index].members[i] == q) {
+            theaterq_syncgrps[q->syncgrp->index].members[i] = NULL;
             break;
         }
     }
 
-    q->syngrp = NULL;
+    q->syncgrp = NULL;
 
 unlock:
     spin_unlock_bh(&theaterq_tree_lock);
@@ -815,8 +814,6 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     u64 check_len;
     bool orphaned = false;
 
-    q->q++;
-
 #define UPDATE_PRIV_LOCAL(new) do { \
                             WRITE_ONCE(q->current_entry, new); \
                             current_entry = new; \
@@ -1284,7 +1281,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->cont_mode = THEATERQ_CONT_HOLD;
     q->ingest_mode = THEATERQ_INGEST_MODE_SIMPLE;
     q->allow_gso = false;
-    q->syngrp = NULL;
+    q->syncgrp = NULL;
     q->isdup = false;
     q->t_busy_time = 0ULL;
     q->t_updated = THEATERQ_NO_EXPIRY;
@@ -1355,7 +1352,7 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
     if (nla_put_s32(skb, TCA_THEATERQ_PKT_OVERHEAD, q->packet_overhead))
         goto nla_put_failure;
     
-    s32 syncgroup = q->syngrp == NULL ? THEATERQ_SYNCGROUP_LEAVE : q->syngrp->index;
+    s32 syncgroup = q->syncgrp == NULL ? THEATERQ_SYNCGROUP_LEAVE : q->syncgrp->index;
     if (nla_put_s32(skb, TCA_THEATERQ_SYNCGRP, syncgroup))
         goto nla_put_failure;
     
@@ -1506,12 +1503,12 @@ MODULE_VERSION("1.0");
 MODULE_ALIAS_NET_SCH("theaterq");
 #endif
 
-module_param(syngrps, byte, S_IRUSR | S_IRGRP | S_IROTH);
-MODULE_PARM_DESC(syngrps, 
+module_param(syncgrps, byte, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(syncgrps, 
                  "Maximum synchronization groups (u8, default=8)");
 
-module_param(syngrps_members, byte, S_IRUSR | S_IRGRP | S_IROTH);
-MODULE_PARM_DESC(syngrps_members, 
+module_param(syncgrps_members, byte, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(syncgrps_members, 
                  "Maximum members per synchronization group (u8, default=8)");
 
 static int __init sch_theaterq_init(void)
@@ -1525,23 +1522,23 @@ static int __init sch_theaterq_init(void)
         return -ENOMEM;
     }
 
-    theaterq_syngrps = kmalloc_array(((u32) syngrps), 
-                                     sizeof(struct theaterq_syngrp), 
+    theaterq_syncgrps = kmalloc_array(((u32) syncgrps), 
+                                     sizeof(struct theaterq_syncgrp), 
                                      GFP_KERNEL);
 
-    if (!theaterq_syngrps) {
+    if (!theaterq_syncgrps) {
         printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups\n");
         kmem_cache_destroy(theaterq_cache);
         theaterq_cache = NULL;
         return -ENOMEM;
     }
     s32 i;
-    for (i = 0; i < syngrps; i++) {
-        theaterq_syngrps[i].index = i;
-        theaterq_syngrps[i].members = kcalloc(syngrps_members, 
+    for (i = 0; i < syncgrps; i++) {
+        theaterq_syncgrps[i].index = i;
+        theaterq_syncgrps[i].members = kcalloc(syncgrps_members, 
                                              sizeof(struct theaterq_sched_data *), 
                                              GFP_KERNEL);
-        if (theaterq_syngrps[i].members == NULL) {
+        if (theaterq_syncgrps[i].members == NULL) {
             goto init_failed;
         }
     }
@@ -1550,11 +1547,11 @@ static int __init sch_theaterq_init(void)
 
 init_failed:
     while (--i >= 0) {
-        kfree(theaterq_syngrps[i].members);
+        kfree(theaterq_syncgrps[i].members);
     }
 
-    kfree(theaterq_syngrps);
-    theaterq_syngrps = NULL;
+    kfree(theaterq_syncgrps);
+    theaterq_syncgrps = NULL;
     kmem_cache_destroy(theaterq_cache);
     theaterq_cache = NULL;
     return -ENOMEM;
@@ -1567,13 +1564,13 @@ static void __exit sch_theaterq_exit(void)
         theaterq_cache = NULL;
     }
 
-    if (theaterq_syngrps) {
-        for (s32 i = 0; i < syngrps; i++) {
-            kfree(theaterq_syngrps[i].members);
+    if (theaterq_syncgrps) {
+        for (s32 i = 0; i < syncgrps; i++) {
+            kfree(theaterq_syncgrps[i].members);
         }
 
-        kfree(theaterq_syngrps);
-        theaterq_syngrps = NULL;
+        kfree(theaterq_syncgrps);
+        theaterq_syncgrps = NULL;
     }
 
     unregister_qdisc(&theaterq_qdisc_ops);
