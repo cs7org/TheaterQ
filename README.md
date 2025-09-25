@@ -1,9 +1,9 @@
 # TheaterQ: Kernel Module for Dynamic Link Emulation
 
-TheaterQ provides a qdisc for network emulation.
+TheaterQ provides a Linux queueing discipline for network emulation.
 It can introduce different link impairments, e.g., bandwidth bottlenecks, delays, packet drops or packet reordering.
 In difference to *NetEm*, these impairments can be configured with changes over time using Trace Files in a CSV format.
-Therefore, it can be used to emulate networks links or paths with dynamic characteristics.
+Therefore, it can be used to emulate network links or paths with dynamic characteristics.
 
 ## Kernel Module
 Build & Install:

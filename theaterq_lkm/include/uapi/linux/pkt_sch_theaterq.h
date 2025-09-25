@@ -58,7 +58,7 @@ enum {
 #define TCA_THEATERQ_MAX (__TCA_THEATERQ_MAX - 1)
 
 struct theaterq_entry {
-    __u64 delay;
+    __u64 keep;
     __u64 latency;
     __u64 jitter;
     __u64 rate;

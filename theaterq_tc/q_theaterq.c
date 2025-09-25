@@ -22,7 +22,7 @@
 static void explain(void)
 {
     fprintf(stderr, "Usage: ... theaterq [stage {LOAD|RUN|ARM|CLEAR}]\n"
-                    "                    [cont {LOOP|HOLD|CLEAR}]\n"
+                    "                    [cont {LOOP|HOLD|CLEAN}]\n"
                     "                    [byteqlen|pktqlen]\n"
                     "                    [allow_gso|prevent_gso]\n"
                     "                    [ingest {SIMPLE|EXTENDED}]\n"
@@ -326,12 +326,12 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
         open_json_object("current");
 
         if (is_json_context()) {
-            print_float(PRINT_JSON, "delay", NULL, 
+            print_float(PRINT_JSON, "latency", NULL, 
                         (double) entry_current->latency / 1000000000.0);
             print_float(PRINT_JSON, "jitter", NULL, 
                         (double) entry_current->jitter / 1000000000.0);
         } else {
-            print_string(PRINT_FP, NULL, " delay %s", 
+            print_string(PRINT_FP, NULL, " latency %s", 
                          sprint_time64(entry_current->latency, b1));
             if (entry_current->jitter != 0)
                 print_string(PRINT_FP, NULL, "  %s", 
@@ -387,10 +387,10 @@ static int theaterq_print_xstats(const struct qdisc_util *qu, FILE *f,
         stats = &_stats;
     }
 
-    print_u64(PRINT_FP, NULL, " tfifo %llub", stats->edfq_blen);
+    print_u64(PRINT_FP, NULL, " edfq %llub", stats->edfq_blen);
     print_u64(PRINT_FP, NULL, " %llup", stats->edfq_plen);
-    print_u64(PRINT_JSON, "tfifo_blen", NULL, stats->edfq_blen);
-    print_u64(PRINT_JSON, "tfifo_plen", NULL, stats->edfq_plen);
+    print_u64(PRINT_JSON, "edfq_blen", NULL, stats->edfq_blen);
+    print_u64(PRINT_JSON, "edfq_plen", NULL, stats->edfq_plen);
     print_u64(PRINT_ANY, "looped", " looped %llu", stats->looped);
     print_string(PRINT_FP, NULL, " duration %s", 
                  sprint_time64(stats->total_time, b1));

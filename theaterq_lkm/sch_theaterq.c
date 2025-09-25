@@ -42,7 +42,7 @@ static u8 syncgrps = 8;
 static u8 syncgrps_members = 8;
 
 static const struct theaterq_entry theaterq_default_entry = {
-    .delay = THEATERQ_NO_EXPIRY,
+    .keep = THEATERQ_NO_EXPIRY,
     .latency = 0ULL,
     .jitter = 0ULL,
     .rate = 0ULL,
@@ -55,7 +55,7 @@ static const struct theaterq_entry theaterq_default_entry = {
 
 enum {
     THEATERQ_CDEV_AVAILABLE,
-    THEATERQ_CDEV_OPENED,
+    THEATERQ_CDEV_LOCKED,
 };
 
 enum {
@@ -160,8 +160,8 @@ struct theaterq_skb_cb {
 // Forward declarations
 static void entry_list_clear(struct theaterq_sched_data *);
 static struct sk_buff *theaterq_peek(struct theaterq_sched_data *);
-static void theaterq_stop_replay(struct theaterq_sched_data *q);
-static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now);
+static void theaterq_stop_replay(struct theaterq_sched_data *q, bool);
+static int theaterq_start_replay(struct theaterq_sched_data *q, u64);
 
 static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q,
                                        u32 own_newstage)
@@ -170,7 +170,7 @@ static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q,
 
     // If no syncgroup is set: Just stop own instance
     if (!q->syncgrp) {
-        theaterq_stop_replay(q);
+        theaterq_stop_replay(q, true);
         q->stage = own_newstage;
         goto unlock;
     }
@@ -188,7 +188,7 @@ static void theaterq_syncgroup_stopall(struct theaterq_sched_data *q,
             instance->stage != THEATERQ_STAGE_FINISH)
                 continue;
 
-        theaterq_stop_replay(instance);
+        theaterq_stop_replay(instance, true);
 
         if (instance != q)
             instance->stage = THEATERQ_STAGE_LOAD;
@@ -200,8 +200,9 @@ unlock:
     spin_unlock_bh(&theaterq_tree_lock);
 }
 
-static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
+static int theaterq_syncgroup_startall(struct theaterq_sched_data *q)
 {
+    int ret = 0;
     u64 now = ktime_get_ns();
     spin_lock_bh(&theaterq_tree_lock);
 
@@ -210,7 +211,7 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
         if (q->stage == THEATERQ_STAGE_LOAD ||
             q->stage == THEATERQ_STAGE_FINISH ||
             q->stage == THEATERQ_STAGE_ARM)
-                theaterq_start_replay(q, now);
+                ret = theaterq_start_replay(q, now);
 
         goto unlock;
     }
@@ -229,13 +230,16 @@ static void theaterq_syncgroup_startall(struct theaterq_sched_data *q)
                 continue;
 
         int errno = theaterq_start_replay(instance, now);
-        if (errno)
+        if (errno) {
             printk(KERN_WARNING "theaterq: Unable to start member %i in "
                                 "syncgroup %d: %d\n", i, grp, errno);
+            ret = errno;
+        }
     }
 
 unlock:
     spin_unlock_bh(&theaterq_tree_lock);
+    return ret;
 }
 
 static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
@@ -458,6 +462,10 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
               (struct theaterq_entry *) &theaterq_default_entry);
         return -EINVAL;
     }
+
+    if (atomic_cmpxchg(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE, 
+                       THEATERQ_CDEV_LOCKED))
+        return -EBUSY;
     
     q->e_current = 0;
     q->e_progresstime = 0;
@@ -469,14 +477,17 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     return 0;
 }
 
-// Always called under global lock.
 // Stage transition not handled here, because its depends on the context
-static void theaterq_stop_replay(struct theaterq_sched_data *q)
+static void theaterq_stop_replay(struct theaterq_sched_data *q, bool clear)
 {
-    WRITE_ONCE(q->current_entry, 
-              (struct theaterq_entry *) &theaterq_default_entry);
+    if (clear) {
+        WRITE_ONCE(q->current_entry, 
+                  (struct theaterq_entry *) &theaterq_default_entry);
+        q->e_current = 0;
+    }
+
     q->t_updated = THEATERQ_NO_EXPIRY;
-    q->e_current = 0;
+    atomic_set(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE);
 }
 
 // CHARDEV OPS =================================================================
@@ -490,7 +501,7 @@ static int ingest_cdev_open(struct inode *inode, struct file *filp)
 
     // Ensure that only one process has access to the chardev at a time
     if (atomic_cmpxchg(&q->ingest_cdev.opened, THEATERQ_CDEV_AVAILABLE, 
-                       THEATERQ_CDEV_OPENED))
+                       THEATERQ_CDEV_LOCKED))
         return -EBUSY;
 
     try_module_get(THIS_MODULE);
@@ -523,6 +534,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
     
     char kbuf[THEATERQ_INGEST_MAXLEN];
     size_t actual_read = 0;
+    ssize_t ret = 0;
+    struct theaterq_entry *entry;
 
     if (len == 0) {
         printk(KERN_WARNING
@@ -570,15 +583,12 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 // Replace the \n before parsing to mark end of string
                 q->ingest_helper.lbuf[q->ingest_helper.lpos - 1] = '\0';
 
-                u64 delay;
-                u64 latency;
-                u64 jitter = 0;
-                u64 rate;
-                u32 loss;
-                u32 limit;
-                u32 dup_prob = 0;
-                u32 dup_delay = 0;
-                struct theaterq_entry *entry;
+                struct theaterq_entry *entry = kmem_cache_alloc(theaterq_cache, GFP_KERNEL);
+                if (!entry) {
+                    printk(KERN_ERR 
+                           "sch_theaterq: Unable to alloc memory for entry\n");
+                    return -ENOMEM;
+                }
 
                 /* Simple input format:
                  * KEEP,LATENCY,RATE,LOSS,LIMIT\n
@@ -604,7 +614,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                               "sch_theaterq: Parsing error at pos %u in entry %llu\n", \
                               i, q->e_entries + 1); \
                         q->ingest_helper.lpos = 0; \
-                        return -EINVAL; \
+                        ret = -EINVAL; \
+                        goto cleanup_failed_entry; \
                     } \
                     i++; \
                 } while (0)
@@ -616,14 +627,14 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 
                 // Parse all entries delimited by ',', some are only
                 // required for the EXTENDED format
-                PARSE_TOKEN(kstrtou64, &delay);
-                PARSE_TOKEN(kstrtou64, &latency);
-                PARSE_TOKEN_EXTENDED(kstrtou64, &jitter);
-                PARSE_TOKEN(kstrtou64, &rate);
-                PARSE_TOKEN(kstrtou32, &loss);
-                PARSE_TOKEN(kstrtou32, &limit);
-                PARSE_TOKEN_EXTENDED(kstrtou32, &dup_prob);
-                PARSE_TOKEN_EXTENDED(kstrtou32, &dup_delay);
+                PARSE_TOKEN(kstrtou64, &entry->keep);
+                PARSE_TOKEN(kstrtou64, &entry->latency);
+                PARSE_TOKEN_EXTENDED(kstrtou64, &entry->jitter);
+                PARSE_TOKEN(kstrtou64, &entry->rate);
+                PARSE_TOKEN(kstrtou32, &entry->loss);
+                PARSE_TOKEN(kstrtou32, &entry->limit);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_prob);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_delay);
 
 #undef PARSE_TOKEN_EXTENDED
 #undef PARSE_TOKEN
@@ -635,39 +646,29 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                            "sch_theaterq: Unable to parse line: Unexpected "
                            "input at entry %llu!\n",
                            q->e_entries + 1);
-                    return -EINVAL;
+                    ret = -EINVAL;
+                    goto cleanup_failed_entry;
                 }
 
                 q->ingest_helper.lpos = 0;
 
-                if (delay == 0) {
+                if (entry->keep == 0) {
                     printk(KERN_WARNING 
-                           "sch_theaterq: Zero delay values are not allowed!\n");
-                    return -EINVAL;
+                           "sch_theaterq: Zero keep values are not allowed!\n");
+                    ret = -EINVAL;
+                    goto cleanup_failed_entry;
                 }
 
-                if (delay >= THEATERQ_NO_EXPIRY / THEATERQ_NS_PER_US) {
+                if (entry->keep >= THEATERQ_NO_EXPIRY / THEATERQ_NS_PER_US) {
                     printk(KERN_WARNING 
-                           "sch_theaterq: Delay value too large, max is %lld!\n",
+                           "sch_theaterq: Keep value too large, max is %lld!\n",
                             (THEATERQ_NO_EXPIRY / THEATERQ_NS_PER_US) - 1);
-                    return -EINVAL;
+                    ret = -EINVAL;
+                    goto cleanup_failed_entry;
                 }
 
-                entry = kmem_cache_alloc(theaterq_cache, GFP_KERNEL);
-                if (!entry) {
-                    printk(KERN_ERR 
-                           "sch_theaterq: Unable to alloc memory for entry\n");
-                    return -ENOMEM;
-                }
-
-                entry->delay = delay * THEATERQ_NS_PER_US; // µs -> ns 
-                entry->latency = latency;
-                entry->jitter = jitter;
-                entry->rate = rate / 8; // bits per second -> byte per second
-                entry->loss = loss;
-                entry->limit = limit;
-                entry->dup_prob = dup_prob;
-                entry->dup_delay = dup_delay;
+                entry->keep = entry->keep * THEATERQ_NS_PER_US; // µs -> ns 
+                entry->rate = div64_u64(entry->rate, 8); // bits per second -> byte per second
                 entry->next = NULL;
 
                 // Access to the linked list only under lock, to prevent
@@ -677,9 +678,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 if (q->stage != THEATERQ_STAGE_LOAD || q->deletion_pending) {
                     printk(KERN_WARNING 
                            "sch_theaterq: Qdisc not in load stage, or deletion pending.\n");
-                    spin_unlock_bh(&q->e_lock);
-                    kmem_cache_free(theaterq_cache, entry);
-                    return -EBUSY;
+                    ret = -EBUSY;
+                    goto cleanup_failed_unlock;
                 }
 
                 if (q->e_head == NULL) {
@@ -691,7 +691,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 }
 
                 q->e_entries++;
-                q->e_totaltime += entry->delay;
+                q->e_totaltime += entry->keep;
+                entry = NULL;
 
                 spin_unlock_bh(&q->e_lock);
             }
@@ -703,6 +704,13 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
     }
     
     return actual_read;
+
+cleanup_failed_unlock:
+    spin_unlock_bh(&q->e_lock);
+cleanup_failed_entry:
+    if (entry != NULL)
+        kmem_cache_free(theaterq_cache, entry);
+    return ret;
 }
 
 static struct file_operations theaterq_cdev_fops = {
@@ -821,8 +829,8 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     
     // Check if the current_entry is still valid or if the pointer needs
     // to be moved to a future entry
-    if (unlikely(current_entry->delay != THEATERQ_NO_EXPIRY && 
-                 q->t_updated + current_entry->delay <= now)) {
+    if (unlikely(current_entry->keep != THEATERQ_NO_EXPIRY && 
+                 q->t_updated + current_entry->keep <= now)) {
 
         // Shortcut for loop cont mode: When the list walk would run over
         // the start of the list (multiple times), we just set our pointer 
@@ -851,16 +859,16 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         // be active during this moment. Long listwalks here a critical,
         // since the functions is called under the fastpath lock, so no
         // other enqueue can be called concurrently for this instance
-        while (now - q->t_updated >= current_entry->delay) {
-            q->t_updated += current_entry->delay;
-            q->e_progresstime += current_entry->delay;
+        while (now - q->t_updated >= current_entry->keep) {
+            q->t_updated += current_entry->keep;
+            q->e_progresstime += current_entry->keep;
 
             if (!current_entry->next) {
                 // No more list entries are available. cont_mode will 
                 // define how to continue.
                 switch (q->cont_mode) {
                     case THEATERQ_CONT_LOOP:
-                        q->stats.total_time += current_entry->delay;
+                        q->stats.total_time += current_entry->keep;
                         q->stats.total_entries++;
                         q->e_progresstime = 0;
                         q->e_current = 0;
@@ -871,8 +879,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                         // THEATERQ_NO_EXPIRY: Static entry that will not
                         // change anymore, prevent future list walks with
                         // possible u64 overflows
-                        q->t_updated = THEATERQ_NO_EXPIRY;
-                        q->e_current = 0;
+                        theaterq_stop_replay(q, true);
                         q->e_progresstime = 0;
                         q->t_busy_time = 0;
                         q->stage = THEATERQ_STAGE_FINISH;
@@ -882,12 +889,12 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                         /* fall through */
                     default:
                         q->stage = THEATERQ_STAGE_FINISH;
-                        q->t_updated = THEATERQ_NO_EXPIRY;
+                        theaterq_stop_replay(q, false);
                         goto leave_update_loop;
                 }
             } else {
                 // Default case: Just select the next entry in list
-                q->stats.total_time += current_entry->delay;
+                q->stats.total_time += current_entry->keep;
                 q->stats.total_entries++;
                 q->e_current++;
                 UPDATE_PRIV_LOCAL(current_entry->next);
@@ -1313,7 +1320,7 @@ static void theaterq_reset(struct Qdisc *sch)
     edfq_reset(sch);
     // Leave the syncgroup but do not stop the other members
     theaterq_syncgroup_leave(q);
-    theaterq_stop_replay(q);
+    theaterq_stop_replay(q, true);
     q->stage = THEATERQ_STAGE_LOAD;
     theaterq_stats_clear(&q->stats);
     q->t_busy_time = 0;
