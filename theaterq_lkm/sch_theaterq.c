@@ -814,6 +814,105 @@ static int destroy_ingest_cdev(struct Qdisc *sch)
 
 // QDISC OPS ===================================================================
 
+static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q, 
+                                                 s64 now)
+{
+    struct theaterq_entry *current_entry = READ_ONCE(q->current_entry);
+
+    if (unlikely(!current_entry)) {
+        WRITE_ONCE(q->current_entry, 
+                   (struct theaterq_entry *) &theaterq_default_entry);
+        return q->current_entry;
+    }
+
+    // Check if the current_entry is still valid or if the pointer needs
+    // to be moved to a future entry
+    if (likely(q->t_updated + current_entry->keep > now ||
+               current_entry->keep == THEATERQ_NO_EXPIRY))
+            return current_entry;
+    
+    printk(KERN_WARNING "UPDATE\n");
+    
+#define UPDATE_PRIV_LOCAL(new) do { \
+                            WRITE_ONCE(q->current_entry, new); \
+                            current_entry = new; \
+                        } while (0)
+
+    // Shortcut for loop cont mode: When the list walk would run over
+    // the start of the list (multiple times), we just set our pointer 
+    // to the beginning of the list before entering the list walk,
+    // thus shortcutting whole list walks during low packet load and/or
+    // high update rates
+    u64 time_since_update = now - q->t_updated;
+    if (q->cont_mode == THEATERQ_CONT_LOOP && 
+        time_since_update >= q->e_totaltime) {
+        
+        u64 full_loops = time_since_update / q->e_totaltime;
+
+        if (full_loops >= 1) {
+            q->stats.looped += full_loops;
+            q->stats.total_time += full_loops * q->e_totaltime;
+            q->stats.total_entries += full_loops * q->e_entries;
+            q->t_updated += full_loops * q->e_totaltime;
+        }
+
+        q->e_current = 0;
+        q->e_progresstime = 0;
+        UPDATE_PRIV_LOCAL(q->e_head);
+    }
+
+    // Perform a list walk until the entry is selected that should
+    // be active during this moment. Long listwalks here a critical,
+    // since the functions is called under the fastpath lock, so no
+    // other enqueue can be called concurrently for this instance
+    while (now - q->t_updated >= current_entry->keep) {
+        q->t_updated += current_entry->keep;
+        q->e_progresstime += current_entry->keep;
+
+        if (!current_entry->next) {
+            // No more list entries are available. cont_mode will 
+            // define how to continue.
+            switch (q->cont_mode) {
+                case THEATERQ_CONT_LOOP:
+                    q->stats.total_time += current_entry->keep;
+                    q->stats.total_entries++;
+                    q->e_progresstime = 0;
+                    q->e_current = 0;
+                    q->stats.looped++;
+                    UPDATE_PRIV_LOCAL(q->e_head);
+                    break;
+                case THEATERQ_CONT_CLEAN:
+                    // THEATERQ_NO_EXPIRY: Static entry that will not
+                    // change anymore, prevent future list walks with
+                    // possible u64 overflows
+                    theaterq_stop_replay(q, true);
+                    q->e_progresstime = 0;
+                    q->t_busy_time = 0;
+                    q->stage = THEATERQ_STAGE_FINISH;
+                    UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
+                    goto leave_update_loop;
+                case THEATERQ_CONT_HOLD:
+                    /* fall through */
+                default:
+                    q->stage = THEATERQ_STAGE_FINISH;
+                    theaterq_stop_replay(q, false);
+                    goto leave_update_loop;
+            }
+        } else {
+            // Default case: Just select the next entry in list
+            q->stats.total_time += current_entry->keep;
+            q->stats.total_entries++;
+            q->e_current++;
+            UPDATE_PRIV_LOCAL(current_entry->next);
+        }
+    }
+
+#undef UPDATE_PRIV_LOCAL
+
+leave_update_loop:
+    return current_entry;
+}
+
 // Enqueue a segment: Packet. Main EDFQ insertion function.
 static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                                 struct sk_buff **to_free)
@@ -828,101 +927,12 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         (void) theaterq_syncgroup_startall(q);
     }
 
-    struct theaterq_entry *current_entry = READ_ONCE(q->current_entry);
-
-    // Failsave. This should never happen.
-    if (unlikely(!current_entry))
-        WRITE_ONCE(current_entry, 
-                  (struct theaterq_entry *) &theaterq_default_entry);
-
     s64 now = ktime_get_ns();
+    struct theaterq_entry *current_entry = theaterq_get_entry(q, now);
     s64 delay = 0;
     u64 check_len;
     bool orphaned = false;
 
-#define UPDATE_PRIV_LOCAL(new) do { \
-                            WRITE_ONCE(q->current_entry, new); \
-                            current_entry = new; \
-                        } while (0)
-    
-    // Check if the current_entry is still valid or if the pointer needs
-    // to be moved to a future entry
-    if (unlikely(current_entry->keep != THEATERQ_NO_EXPIRY && 
-                 q->t_updated + current_entry->keep <= now)) {
-
-        // Shortcut for loop cont mode: When the list walk would run over
-        // the start of the list (multiple times), we just set our pointer 
-        // to the beginning of the list before entering the list walk,
-        // thus shortcutting whole list walks during low packet load and/or
-        // high update rates
-        u64 time_since_update = now - q->t_updated;
-        if (q->cont_mode == THEATERQ_CONT_LOOP &&
-            time_since_update >= q->e_totaltime - q->e_progresstime) {
-            
-            u64 full_loops = time_since_update / q->e_totaltime;
-
-            if (full_loops >= 1) {
-                q->stats.looped += full_loops;
-                q->stats.total_time += full_loops * q->e_totaltime;
-                q->stats.total_entries += full_loops * q->e_entries;
-                q->t_updated += full_loops * q->e_totaltime;
-            }
-
-            q->e_current = 0;
-            q->e_progresstime = 0;
-            UPDATE_PRIV_LOCAL(q->e_head);
-        }
-
-        // Perform a list walk until the entry is selected that should
-        // be active during this moment. Long listwalks here a critical,
-        // since the functions is called under the fastpath lock, so no
-        // other enqueue can be called concurrently for this instance
-        while (now - q->t_updated >= current_entry->keep) {
-            q->t_updated += current_entry->keep;
-            q->e_progresstime += current_entry->keep;
-
-            if (!current_entry->next) {
-                // No more list entries are available. cont_mode will 
-                // define how to continue.
-                switch (q->cont_mode) {
-                    case THEATERQ_CONT_LOOP:
-                        q->stats.total_time += current_entry->keep;
-                        q->stats.total_entries++;
-                        q->e_progresstime = 0;
-                        q->e_current = 0;
-                        q->stats.looped++;
-                        UPDATE_PRIV_LOCAL(q->e_head);
-                        break;
-                    case THEATERQ_CONT_CLEAN:
-                        // THEATERQ_NO_EXPIRY: Static entry that will not
-                        // change anymore, prevent future list walks with
-                        // possible u64 overflows
-                        theaterq_stop_replay(q, true);
-                        q->e_progresstime = 0;
-                        q->t_busy_time = 0;
-                        q->stage = THEATERQ_STAGE_FINISH;
-                        UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
-                        goto leave_update_loop;
-                    case THEATERQ_CONT_HOLD:
-                        /* fall through */
-                    default:
-                        q->stage = THEATERQ_STAGE_FINISH;
-                        theaterq_stop_replay(q, false);
-                        goto leave_update_loop;
-                }
-            } else {
-                // Default case: Just select the next entry in list
-                q->stats.total_time += current_entry->keep;
-                q->stats.total_entries++;
-                q->e_current++;
-                UPDATE_PRIV_LOCAL(current_entry->next);
-            }
-        }
-    }
-
-#undef UPDATE_PRIV_LOCAL
-
-leave_update_loop:
     // At this point: current_entry is the entry that should be active at
     // this point in time
 
@@ -1301,7 +1311,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     // We will manage our queue sizes ourselves
     sch->limit = __UINT32_MAX__;
 
-    // Setup the inital state
+    // Set up the initial state
     q->stage = THEATERQ_STAGE_LOAD;
     q->cont_mode = THEATERQ_CONT_HOLD;
     q->ingest_mode = THEATERQ_INGEST_MODE_SIMPLE;
@@ -1360,9 +1370,18 @@ static void theaterq_destroy(struct Qdisc *sch)
 static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
-    struct nlattr *opts = nla_nest_start(skb, TCA_OPTIONS);
 
-    struct theaterq_entry current_entry;
+    // Update the current entry when required. When no packets arrive, the
+    // currently active entry would not be updates, so dump would show an
+    // outdated entry.
+    // This could alter the qdisc's data structure alongside the enqueue
+    // function, so exclusive access is required.
+    sch_tree_lock(sch);
+    struct theaterq_entry *current_entry = theaterq_get_entry(q, ktime_get_ns());
+    sch_tree_unlock(sch);
+
+    struct nlattr *opts = nla_nest_start(skb, TCA_OPTIONS);
+    struct theaterq_entry current_entry_nla;
 
     if (!opts)
         return -EMSGSIZE;
@@ -1407,12 +1426,12 @@ static int theaterq_dump_qdisc(struct Qdisc *sch, struct sk_buff *skb)
                           q->e_progresstime, TCA_THEATERQ_PAD))
         goto nla_put_failure;
 
-    if (q->current_entry) {
-        memcpy(&current_entry, q->current_entry, sizeof(current_entry));
-        current_entry.next = NULL;
+    if (current_entry) {
+        memcpy(&current_entry_nla, current_entry, sizeof(current_entry_nla));
+        current_entry_nla.next = NULL;
 
         if (nla_put(skb, TCA_THEATERQ_ENTRY_CURRENT, 
-                    sizeof(current_entry), &current_entry))
+                    sizeof(current_entry_nla), &current_entry_nla))
             goto nla_put_failure;
     }
 
