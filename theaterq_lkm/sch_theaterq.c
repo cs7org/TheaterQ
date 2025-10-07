@@ -830,9 +830,7 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
     if (likely(q->t_updated + current_entry->keep > now ||
                current_entry->keep == THEATERQ_NO_EXPIRY))
             return current_entry;
-    
-    printk(KERN_WARNING "UPDATE\n");
-    
+
 #define UPDATE_PRIV_LOCAL(new) do { \
                             WRITE_ONCE(q->current_entry, new); \
                             current_entry = new; \
@@ -845,15 +843,27 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
     // high update rates
     u64 time_since_update = now - q->t_updated;
     if (q->cont_mode == THEATERQ_CONT_LOOP && 
-        time_since_update >= q->e_totaltime) {
-        
-        u64 full_loops = time_since_update / q->e_totaltime;
+        time_since_update >= (q->e_totaltime - q->e_progresstime)) {
 
+        u64 full_loops = time_since_update / q->e_totaltime;
+        u64 remainder = time_since_update % q->e_totaltime;
+        
+        // Shortcut all full loops over the list
         if (full_loops >= 1) {
+            u64 loop_time = full_loops * q->e_totaltime;
             q->stats.looped += full_loops;
-            q->stats.total_time += full_loops * q->e_totaltime;
             q->stats.total_entries += full_loops * q->e_entries;
-            q->t_updated += full_loops * q->e_totaltime;
+            q->stats.total_time += loop_time;
+            q->t_updated += loop_time;
+        }
+
+        // Shortcut the last loop back the the start of the list
+        if (remainder >= (q->e_totaltime - q->e_progresstime)) {
+            u64 time_to_start = q->e_totaltime - q->e_progresstime;
+            q->stats.looped++;
+            q->stats.total_entries += q->e_entries - q->e_current;
+            q->stats.total_time += time_to_start;
+            q->t_updated += time_to_start;
         }
 
         q->e_current = 0;
@@ -890,13 +900,13 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
                     q->t_busy_time = 0;
                     q->stage = THEATERQ_STAGE_FINISH;
                     UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
-                    goto leave_update_loop;
+                    return current_entry;
                 case THEATERQ_CONT_HOLD:
                     /* fall through */
                 default:
                     q->stage = THEATERQ_STAGE_FINISH;
                     theaterq_stop_replay(q, false);
-                    goto leave_update_loop;
+                    return current_entry;
             }
         } else {
             // Default case: Just select the next entry in list
@@ -909,7 +919,6 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
 
 #undef UPDATE_PRIV_LOCAL
 
-leave_update_loop:
     return current_entry;
 }
 
