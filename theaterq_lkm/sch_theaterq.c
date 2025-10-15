@@ -1236,7 +1236,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
                    q->stage != new_stage) {
             start_replay = THEATERQ_REPLAY_STOP;
         } else if (new_stage == THEATERQ_STAGE_ARM) {
-            start_replay = THEATERQ_REPLAY_STOP;
+            q->stage = new_stage;
         } else if (new_stage == THEATERQ_STAGE_RUN) {
             if (!q->e_entries) {
                 ret = -ENODATA;
