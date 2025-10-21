@@ -50,6 +50,7 @@ along with this program; If not, see <http://www.gnu.org/licenses/>.
 #define THEATERQ_NO_SYNCGRP_SELECTED -2
 #define THEATERQ_NS_PER_US 1000
 #define THEATERQ_NO_EXPIRY U64_MAX
+#define THEATERQ_ALLOW_IMPLICIT_REORDER 0
 
 // Slab allocator for Trace File entries of all instances
 static struct kmem_cache *theaterq_cache = NULL;
@@ -68,6 +69,7 @@ static const struct theaterq_entry theaterq_default_entry = {
     .limit = 1000UL,
     .dup_prob = 0UL,
     .dup_delay = 0UL,
+    .route_id = 0UL,
     .next = NULL,
 };
 
@@ -143,6 +145,11 @@ struct theaterq_sched_data {
     } ingest_helper;
 
     u64 t_updated;
+
+    // State for route handling to prevent unwanted implicit packet 
+    // reordering within a route
+    u32 r_current_route_id;
+    u64 r_last_send_time;
 
     // Referencing back to the theaterq_syncgrps[] entry.
     // NULL = not a member of any snycgroup
@@ -490,6 +497,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     q->t_busy_time = 0;
     q->stage = THEATERQ_STAGE_RUN;
     q->t_updated = now;
+    q->r_last_send_time = 0;
     WRITE_ONCE(q->current_entry, q->e_head);
 
     return 0;
@@ -613,8 +621,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                  *  µs     ns    bps    a)    b)
                  * 
                  * Extended input format:
-                 * KEEP,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY\n
-                 *  µs     ns      ns   bps   a)    b)     a)       ns
+                 * KEEP,LATENCY,JITTER,RATE,LOSS,LIMIT,DUP_PROP,DUP_DELAY,ROUTE_ID\n
+                 *  µs     ns      ns   bps   a)    b)     a)       ns      b)
                  * 
                  * a) Scaled u32: 0 = 0%, U32_MAX = 100%, kernel does not 
                  *  support floating point numbers
@@ -638,21 +646,25 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     i++; \
                 } while (0)
 
-#define PARSE_TOKEN_EXTENDED(fun, dest) do { \
+#define PARSE_TOKEN_EXTENDED(fun, dest, default) do { \
                     if (q->ingest_mode == THEATERQ_INGEST_MODE_EXTENDED) \
                         PARSE_TOKEN(fun, dest); \
+                    else \
+                        *dest = default; \
                 } while (0)
                 
                 // Parse all entries delimited by ',', some are only
                 // required for the EXTENDED format
                 PARSE_TOKEN(kstrtou64, &entry->keep);
                 PARSE_TOKEN(kstrtou64, &entry->latency);
-                PARSE_TOKEN_EXTENDED(kstrtou64, &entry->jitter);
+                PARSE_TOKEN_EXTENDED(kstrtou64, &entry->jitter, 0);
                 PARSE_TOKEN(kstrtou64, &entry->rate);
                 PARSE_TOKEN(kstrtou32, &entry->loss);
                 PARSE_TOKEN(kstrtou32, &entry->limit);
-                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_prob);
-                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_delay);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_prob, 0);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_delay, 0);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->route_id, 
+                                     THEATERQ_ALLOW_IMPLICIT_REORDER);
 
 #undef PARSE_TOKEN_EXTENDED
 #undef PARSE_TOKEN
@@ -965,6 +977,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             orphaned = true;
     }
 
+    bool delay_has_dup = false;
     if (!q->isdup && dup_event(q) && 
         (dup_skb = skb_clone(skb, GFP_ATOMIC)) != NULL) {
             struct Qdisc *rootq = qdisc_root_bh(sch);
@@ -975,6 +988,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
             q->isdup = false;
 
             delay += current_entry->dup_delay;
+            delay_has_dup = true;
             if (!orphaned && current_entry->dup_delay)
                 skb_orphan_partial(skb);
     }
@@ -993,8 +1007,24 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
 
-    // Fill the codeblock with current valid data
+    // Fill the codeblock with current valid data, when route handling
+    // is enabled: prevent implicit packet reordering by keeping track of
+    // the current route id and its last earliest send timestamp
+    if (current_entry->route_id != q->r_current_route_id) {
+        q->r_current_route_id = current_entry->route_id;
+        q->r_last_send_time = 0UL;
+    }
+
     cb->earliest_send_time = now + delay;
+
+    if (likely(!delay_has_dup)) {
+        if (cb->earliest_send_time <= q->r_last_send_time)
+            cb->earliest_send_time = q->r_last_send_time + 1;
+
+        if (q->r_current_route_id != THEATERQ_ALLOW_IMPLICIT_REORDER)
+            q->r_last_send_time = cb->earliest_send_time;
+    }
+
     cb->transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
     edfq_enqueue(skb, sch);
 
@@ -1330,6 +1360,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->t_busy_time = 0ULL;
     q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
+    q->r_current_route_id = THEATERQ_ALLOW_IMPLICIT_REORDER;
 
     spin_lock_init(&q->e_lock);
     qdisc_watchdog_init(&q->watchdog, sch);

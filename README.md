@@ -33,7 +33,7 @@ TheaterQ expects two Trace File line formats:
 <KEEP>,<LATENCY>,<RATE>,<LOSS>,<LIMIT>\n
 
 # Extended:
-<KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>\n
+<KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>,<ROUTE_ID>\n
 ```
 Types are identical in both formats. 
 Default format is `SIMPLE`, during creation of a TheaterQ qdisc instance the format can be set to `EXTENDED` by using the `ingest EXTENDED` option.
@@ -45,9 +45,11 @@ Lines starting with a non-numeric character are ignored.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format).
 - **`LIMIT`**: Currently available queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue.
 - **`DUP_PROB`** and **`DUP_DELAY`**: Probability for a packet to be duplicated, as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format). The duplicate will be statically delayed **`DUP_DELAY`** ns. A duplicated packet processed like any other, thus it is additionally affected by the `DELAY` and `JITTER`.
+- **`ROUTE_ID`**: Allow implicit packet reordering only when the route through the network changes. Packets transmitted with the same route ID will not implicitly reorder (e.g. due to delay changes or when jitter is high), only during changes of the route ID implicit packet reordering is possible. Use 0 (default in simple format) to always allow implicit packet reordering.
+Duplicated packets with `DUP_DELAY` are not affected by the route ID.
 
 On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
-Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering.
+Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering, as long as `ROUTE_ID` is not used.
 
 ## Usage
 Install the kernel module and set `TC_LIB_DIR`:
