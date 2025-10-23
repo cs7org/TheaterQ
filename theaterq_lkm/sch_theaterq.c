@@ -59,6 +59,7 @@ static struct kmem_cache *theaterq_cache = NULL;
 static DEFINE_SPINLOCK(theaterq_tree_lock);
 static u8 syncgrps = 8;
 static u8 syncgrps_members = 8;
+static u16 reorder_routes = 255;
 
 static const struct theaterq_entry theaterq_default_entry = {
     .keep = THEATERQ_NO_EXPIRY,
@@ -148,8 +149,7 @@ struct theaterq_sched_data {
 
     // State for route handling to prevent unwanted implicit packet 
     // reordering within a route
-    u32 r_current_route_id;
-    u64 r_last_send_time;
+    u64 *r_last_send_times;
 
     // Referencing back to the theaterq_syncgrps[] entry.
     // NULL = not a member of any snycgroup
@@ -497,7 +497,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     q->t_busy_time = 0;
     q->stage = THEATERQ_STAGE_RUN;
     q->t_updated = now;
-    q->r_last_send_time = 0;
+    memset(q->r_last_send_times, (reorder_routes + 1) * sizeof(u64), 0);
     WRITE_ONCE(q->current_entry, q->e_head);
 
     return 0;
@@ -693,6 +693,14 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     printk(KERN_WARNING 
                            "sch_theaterq: Keep value too large, max is %lld!\n",
                             (THEATERQ_NO_EXPIRY / THEATERQ_NS_PER_US) - 1);
+                    ret = -EINVAL;
+                    goto cleanup_failed_entry;
+                }
+
+                if (entry->route_id > reorder_routes) {
+                    printk(KERN_WARNING 
+                           "sch_theaterq: Reorder route index is too large, max is %d!\n",
+                            reorder_routes);
                     ret = -EINVAL;
                     goto cleanup_failed_entry;
                 }
@@ -1010,19 +1018,14 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     // Fill the codeblock with current valid data, when route handling
     // is enabled: prevent implicit packet reordering by keeping track of
     // the current route id and its last earliest send timestamp
-    if (current_entry->route_id != q->r_current_route_id) {
-        q->r_current_route_id = current_entry->route_id;
-        q->r_last_send_time = 0UL;
-    }
-
     cb->earliest_send_time = now + delay;
 
     if (likely(!delay_has_dup)) {
-        if (cb->earliest_send_time <= q->r_last_send_time)
-            cb->earliest_send_time = q->r_last_send_time + 1;
+        if (cb->earliest_send_time <= q->r_last_send_times[current_entry->route_id])
+            cb->earliest_send_time = q->r_last_send_times[current_entry->route_id] + 1;
 
-        if (q->r_current_route_id != THEATERQ_ALLOW_IMPLICIT_REORDER)
-            q->r_last_send_time = cb->earliest_send_time;
+        if (current_entry->route_id != THEATERQ_ALLOW_IMPLICIT_REORDER)
+            q->r_last_send_times[current_entry->route_id] = cb->earliest_send_time;
     }
 
     cb->transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
@@ -1347,6 +1350,14 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
+    q->r_last_send_times = kmalloc((reorder_routes + 1) * sizeof(u64), 
+                                   GFP_KERNEL);
+
+    if (!q->r_last_send_times) {
+        printk(KERN_ERR "theaterq: Unable to allocate memory for reorder route cache.\n");
+        return -ENOMEM;
+    }
+
     // We will manage our queue sizes ourselves
     sch->limit = __UINT32_MAX__;
 
@@ -1360,7 +1371,6 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->t_busy_time = 0ULL;
     q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
-    q->r_current_route_id = THEATERQ_ALLOW_IMPLICIT_REORDER;
 
     spin_lock_init(&q->e_lock);
     qdisc_watchdog_init(&q->watchdog, sch);
@@ -1401,6 +1411,7 @@ static void theaterq_destroy(struct Qdisc *sch)
     struct theaterq_sched_data *q = qdisc_priv(sch);
     qdisc_watchdog_cancel(&q->watchdog);
     theaterq_syncgroup_leave(q);
+    kfree(q->r_last_send_times);
     destroy_ingest_cdev(sch);
     // enqueue will not be called again here
     entry_list_clear(q);
@@ -1594,6 +1605,10 @@ MODULE_PARM_DESC(syncgrps,
 module_param(syncgrps_members, byte, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(syncgrps_members, 
                  "Maximum members per synchronization group (u8, default=8)");
+
+module_param(reorder_routes, short, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(reorder_routes, 
+                 "Number of different reorder routes to keep track of (u16, default=255)");
 
 static int __init sch_theaterq_init(void)
 {
