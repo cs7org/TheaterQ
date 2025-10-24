@@ -23,6 +23,10 @@ git submodule update --init
 cd theaterq_tc
 make all
 
+# Make sure iproute2 is installed on the target system, e.g. on Debian:
+# sudo apt install iproute2
+# tc qdisc commands need to be executed with root privileges.
+
 TC_LIB_DIR=tclib tc qdisc [...]
 ```
 
@@ -45,8 +49,9 @@ Lines starting with a non-numeric character are ignored.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format).
 - **`LIMIT`**: Currently available queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue.
 - **`DUP_PROB`** and **`DUP_DELAY`**: Probability for a packet to be duplicated, as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format). The duplicate will be statically delayed **`DUP_DELAY`** ns. A duplicated packet processed like any other, thus it is additionally affected by the `DELAY` and `JITTER`.
-- **`ROUTE_ID`**: Allow implicit packet reordering only when the route through the network changes. Packets transmitted with the same route ID will not implicitly reorder (e.g. due to delay changes or when jitter is high), only during changes of the route ID implicit packet reordering is possible. Use 0 (default in simple format) to always allow implicit packet reordering.
+- **`ROUTE_ID`**: Allow implicit packet reordering only when the route through the network changes. Packets transmitted with the same route ID will not implicitly reorder (e.g. due to delay changes or when jitter is high). Packets transmitted without route ID changes will be transmitted strictly in arrival order, only during changes of the route ID implicit packet reordering is possible. Use 0 (default in simple format) to always allow implicit packet reordering.
 Duplicated packets with `DUP_DELAY` are not affected by the route ID.
+By default, 255 different routes are enabled, see [Module Parameters](#module-parameters) on how to increase this value during module load.
 
 On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
 Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering, as long as `ROUTE_ID` is not used.
@@ -56,6 +61,7 @@ Install the kernel module and set `TC_LIB_DIR`:
 ```bash
 export TC_LIB_DIR=/absolute/path/to/tclib
 ```
+> For a permanent installation of the *iproute2* plugin, the binary `theaterq_tc/tclib/q_theaterq.so` can be copied to `/usr/lib/<OS ARCH>-linux-gnu/tc/`.
 
 TheaterQ is used in the following way:
 
@@ -63,7 +69,7 @@ TheaterQ is used in the following way:
    ```bash
    tc qdisc add dev <oif> root handle <major> theaterq <options>
    ```
-   Since the TheaterQ is classful, it is possible to install other qdiscs as its child. After installing TheaterQ it will first run transparently (no delays, no packet loss).
+   Since the TheaterQ is classful, it is possible to install other qdiscs as its child (Please note: Packets are dropped before they are enqueued in the child qdisc, therefore, AQM qdiscs might not work as expected). After installing TheaterQ it will first run transparently (no delays, no packet loss).
    When required, the extended Trace File format can be enabled using the `ingest EXTENDED` option.
 2. The TheaterQ instance is now in the `LOAD` stage. A character device at `/dev/theaterq:<oif>:<major>:0` is available to ingest the Trace Files.
    ```bash
@@ -98,7 +104,7 @@ It is also possible to set one or more qdiscs to the `ARM` stage; in this case, 
 4. Setting one qdisc of a group to stage `LOAD` or `CLEAR` will set all other members to `LOAD` and stop the Trace File replay.
 5. Pass to `syncgroup -1` to a qdisc to leave the current syncgroup.
 
-By default, 8 syncgroups with 8 members each are available. Up to 256 syncgroups with 256 members each can be configured with the kernel modules parameters `insmod theaterq syngrps=<x> syngrps_members=<y>`.
+By default, 8 syncgroups with 8 members each are available by default. See [Module Parameters](#module-parameters) to change these values during loading of the module.
 
 ## Debugging and Statistics
 
@@ -119,6 +125,18 @@ Important values:
 - `looped`: Number of Trace File repetitions (when cont is `LOOP`)
 - `duration`: Accumulated runtime of all Trace File entries
 - `entries`: Number of entries that were applied
+
+## Module Parameters
+The kernel module can be configured during loading with the following parameters:
+- `syncgrps`: Maximum number of syncgroups (u8, default = 8)
+- `syncgrps_members`: Maximum number of members in each syncgroup (u8, default = 8)
+- `reorder_routes`: Number of different reorder routes (each reorder routes internally tracks an u64 timestamp, static memory allocation for each theaterq instance: *reorder_routes * 8 bytes*). The *ROUTE_ID* in the extended format cannot be larger than this value (u16, default = 255)
+
+Example:
+```bash
+sudo insmod sch_theaterq.ko syncgrps=16 syncgrps_members=16 reorder_routes=1024
+```
+Check the current configuration using `cat /sys/module/sch_theaterq/parameters/{syncgrps,syncgrps_members,reorder_routes}`. Parameter settings cannot be changed while the module is loaded.
 
 ## License
 This project is licensed under the [GNU General Public License v2.0](LICENSE). For more details, see the `LICENSE` file or see https://www.gnu.org/licenses/.
