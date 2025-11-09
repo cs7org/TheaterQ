@@ -83,7 +83,7 @@ struct theaterq_entry {
     __u32 loss;
     __u32 limit;
     __u32 dup_prob;
-    __u32 dup_delay;
+    __u64 dup_delay;
     __u32 route_id;
     struct theaterq_entry *next;
 };

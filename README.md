@@ -35,9 +35,15 @@ TheaterQ expects two Trace File line formats:
 ```
 # Simple:
 <KEEP>,<LATENCY>,<RATE>,<LOSS>,<LIMIT>\n
+  u64     u64      u64    a)     u32
 
 # Extended:
 <KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>,<ROUTE_ID>\n
+  u64     u64      u64      u64     a)    u32       a)         u64         b)
+
+# Type hints:
+# a) Scaled u32: 0% = 0, 100% = U32_MAX
+# b) u32 limited by reorder_routes kernel module options (default max is 244), 0 is reserved
 ```
 Types are identical in both formats. 
 Default format is `SIMPLE`, during creation of a TheaterQ qdisc instance the format can be set to `EXTENDED` by using the `ingest EXTENDED` option.

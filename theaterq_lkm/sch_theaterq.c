@@ -69,7 +69,7 @@ static const struct theaterq_entry theaterq_default_entry = {
     .loss = 0UL,
     .limit = 1000UL,
     .dup_prob = 0UL,
-    .dup_delay = 0UL,
+    .dup_delay = 0ULL,
     .route_id = 0UL,
     .next = NULL,
 };
@@ -662,7 +662,7 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 PARSE_TOKEN(kstrtou32, &entry->loss);
                 PARSE_TOKEN(kstrtou32, &entry->limit);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_prob, 0);
-                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->dup_delay, 0);
+                PARSE_TOKEN_EXTENDED(kstrtou64, &entry->dup_delay, 0);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &entry->route_id, 
                                      THEATERQ_ALLOW_IMPLICIT_REORDER);
 
