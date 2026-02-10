@@ -439,9 +439,9 @@ static void theaterq_fifo_enqueue(struct sk_buff *nskb, struct theaterq_sched_da
     if (q->fifo_tail)
         q->fifo_tail->next = nskb;
     else
-        q->edfq_head = nskb;
+        q->fifo_head = nskb;
 
-    q->edfq_tail = nskb;
+    q->fifo_tail = nskb;
     q->fifo_len++;
     q->fifo_blen += qdisc_pkt_len(nskb);
 }
@@ -515,7 +515,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     if (!q->e_head) {
         q->stage = THEATERQ_STAGE_LOAD;
         q->t_updated = THEATERQ_NO_EXPIRY;
-         WRITE_ONCE(q->current_entry, 
+        WRITE_ONCE(q->current_entry, 
               (struct theaterq_entry *) &theaterq_default_entry);
         return -EINVAL;
     }
@@ -1133,7 +1133,7 @@ static struct sk_buff *theaterq_peek_edfq(struct theaterq_sched_data *q)
 
 static inline struct sk_buff *theaterq_peek_fifo(struct theaterq_sched_data *q)
 {
-    return q->edfq_head;
+    return q->fifo_head;
 }
 
 static void theaterq_erase_head_edfq(struct theaterq_sched_data *q, 
@@ -1169,32 +1169,22 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
     struct theaterq_sched_data *q = qdisc_priv(sch);
     struct sk_buff *skb;
     u64 now = ktime_get_ns();
-    
-edfq_dequeue:
-    // Fastpath qdisc skbs will be dequeued always
-    skb = __qdisc_dequeue_head(&sch->q);
-    if (skb) {
-deliver:
-        qdisc_qstats_backlog_dec(sch, skb);
-        qdisc_bstats_update(sch, skb);
-        return skb;
-    }
 
     // First, check whether a skb can be dequeue from the fifo and
     // enqueued in the edfq
-    skb = theaterq_peek_fifo(q);
-    if (skb) {
-        if (now < q->t_busy_time) {
+    while ((skb = theaterq_peek_fifo(q))) {
+        if (now < READ_ONCE(q->t_busy_time)) {
             // If the link is still busy: Call dequeue again, when it is
             // no longer considered busy. This could be called frequently
             // (e.g., when edfq entries can be dequeued)
             // qdisc_watchdog_schedule_ns will prevent multiple entries
             // for a given time frame, but we will shortcut this check
-            if (q->t_busy_time_scheduled != q->t_busy_time) {
+            if (READ_ONCE(q->t_busy_time_scheduled) != q->t_busy_time) {
                 qdisc_watchdog_schedule_ns(&q->watchdog, q->t_busy_time);
-                q->t_busy_time_scheduled = q->t_busy_time;
+                WRITE_ONCE(q->t_busy_time_scheduled, q->t_busy_time);
             }
 
+            break;
         } else {
             // Link is available, dequeue skb and calculate all required
             // values if not yet happened. Dequeue skb from fifo
@@ -1205,8 +1195,8 @@ deliver:
 
             if (!q->apply_before_q) {
                 skb_delay += get_pkt_delay(current_entry->latency, 
-                                           current_entry->jitter,
-                                           &q->prng);
+                                        current_entry->jitter,
+                                        &q->prng);
                 skb_transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
             }
 
@@ -1217,7 +1207,8 @@ deliver:
             skb->next = NULL;
             skb->prev = NULL;
             
-            // Check reordering state of skb, enforce strict order when required
+            // Check reordering state of skb, enforce strict order 
+            // when required
             if (cb->earliest_send_time <= q->r_last_send_times[current_entry->route_id])
                 cb->earliest_send_time = q->r_last_send_times[current_entry->route_id] + 1;
 
@@ -1233,20 +1224,24 @@ deliver:
             // - Another skb is present in fifo: Make sure, that it is 
             //   dequeued when the link becomes available again
             theaterq_edfq_enqueue(skb, q);
-            q->t_busy_time = now + skb_transmit_time;
+            WRITE_ONCE(q->t_busy_time, now + skb_transmit_time);
             struct sk_buff *first = theaterq_peek_edfq(q);
             if (first) {
                 u64 first_send_time = theaterq_skb_cb(first)->earliest_send_time;
                 if (first_send_time > cb->earliest_send_time)
-                   qdisc_watchdog_schedule_ns(&q->watchdog, cb->earliest_send_time);
-                else if (theaterq_peek_fifo(q) 
-                        && q->t_busy_time_scheduled != q->t_busy_time) {
-
-                    qdisc_watchdog_schedule_ns(&q->watchdog, q->t_busy_time);
-                    q->t_busy_time_scheduled = q->t_busy_time;
-                } 
+                    qdisc_watchdog_schedule_ns(&q->watchdog, cb->earliest_send_time);
             }
         }
+    }
+
+edfq_dequeue:
+    // Fastpath qdisc skbs will be dequeued always
+    skb = __qdisc_dequeue_head(&sch->q);
+    if (skb) {
+deliver:
+        qdisc_qstats_backlog_dec(sch, skb);
+        qdisc_bstats_update(sch, skb);
+        return skb;
     }
 
     skb = theaterq_peek_edfq(q);
