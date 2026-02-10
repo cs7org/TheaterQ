@@ -1,6 +1,6 @@
 /*
 TheaterQ Dynamic Network Emulator Kernel Module
-    Copyright (C) 2025 Martin Ottens
+    Copyright (C) 2025-2026 Martin Ottens
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -63,6 +63,7 @@ enum {
     TCA_THEATERQ_SYNCGRP,
     TCA_THEATERQ_USE_BYTEQ,
     TCA_THEATERQ_ALLOW_GSO,
+    TCA_THEATERQ_APPLY_BEFORE_Q,
     TCA_THEATERQ_ENABLE_ECN,
     TCA_THEATERQ_INGEST_MODE,
     TCA_THEATERQ_INGEST_CDEV,
@@ -94,6 +95,8 @@ struct tc_theaterq_xstats {
     __u64 total_entries;
     __u32 edfq_plen;
     __u64 edfq_blen;
+    __u32 fifo_plen;
+    __u32 fifo_blen;
 };
 
 #endif //__LINUX_PKT_SCH_THEATERQ_H
