@@ -1,0 +1,29 @@
+stages:
+  - buildtest
+
+# Just a buildtest.
+# Module must be linked against the kernel that is running on the target system.
+# Therefore, it is best built locally with correct headers.
+buildtest-lkm:
+  stage: buildtest
+  needs: []
+  image: debian:latest
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  before_script:
+    - apt-get update && apt-get -y --no-install-recommends install linux-headers-$(uname -r) build-essential make
+  script:
+    - echo "Building with kernel $(uname -r)"
+    - make -C ./theaterq_lkm all
+
+buildtest-tc:
+  stage: buildtest
+  needs: []
+  image: debian:latest
+  variables:
+    GIT_SUBMODULE_STRATEGY: recursive
+    GIT_SUBMODULE_DEPTH: 1
+  before_script:
+    - apt-get update && apt-get -y --no-install-recommends install make flex bison build-essential libbpf-dev libelf-dev libtirpc-dev
+  script:
+    - make -C ./theaterq_tc all

@@ -1,6 +1,6 @@
 /*
 TheaterQ Dynamic Network Emulator Kernel Module
-    Copyright (C) 2025 Martin Ottens
+    Copyright (C) 2025-2026 Martin Ottens
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -43,6 +43,7 @@ static void explain(void)
                     "                    [cont {LOOP|HOLD|CLEAN}]\n"
                     "                    [byteqlen|pktqlen]\n"
                     "                    [allow_gso|prevent_gso]\n"
+                    "                    [apply_before_q|apply_after_q]\n"
                     "                    [ingest {SIMPLE|EXTENDED}]\n"
                     "                    [seed SEED]\n"
                     "                    [ecn_enable_ecn|ecn_disable]\n"
@@ -66,6 +67,7 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __s32 syncgroup = -1;
     __u8 use_byteq = Q_THEATERQ_FLAG_NOT_SET; 
     __u8 allow_gso = Q_THEATERQ_FLAG_NOT_SET;
+    __u8 apply_before_q = Q_THEATERQ_FLAG_NOT_SET;
     __u8 enable_ecn = Q_THEATERQ_FLAG_NOT_SET;
     bool has_seed = false;
     bool has_syncgroup = false;
@@ -129,6 +131,12 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
         } else if (matches(*argv, "ecn_disable") == 0) {
             Q_THEATER_CHECK_FLAG(enable_ecn, "ECN");
             enable_ecn = 0;
+        } else if (matches(*argv, "apply_before_q") == 0) {
+            Q_THEATER_CHECK_FLAG(apply_before_q, "Characteristics application");
+            apply_before_q = 1;
+        } else if (matches(*argv, "apply_after_q") == 0) {
+            Q_THEATER_CHECK_FLAG(apply_before_q, "Characteristics application");
+            apply_before_q = 0;
         } else if (matches(*argv, "seed") == 0) {
             NEXT_ARG();
             has_seed = true;
@@ -190,7 +198,10 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
         addattr_l(n, 2048, TCA_THEATERQ_USE_BYTEQ, &use_byteq, sizeof(use_byteq)) < 0)
             return -1;
     if (allow_gso != Q_THEATERQ_FLAG_NOT_SET &&
-        addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(use_byteq)) < 0)
+        addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(allow_gso)) < 0)
+            return -1;
+    if (apply_before_q != Q_THEATERQ_FLAG_NOT_SET &&
+        addattr_l(n, 2048, TCA_THEATERQ_APPLY_BEFORE_Q, &apply_before_q, sizeof(apply_before_q)) < 0)
             return -1;
     if (enable_ecn != Q_THEATERQ_FLAG_NOT_SET &&
         addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &enable_ecn, sizeof(enable_ecn)) < 0)
@@ -294,6 +305,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                  " bytequeue %s", tb[TCA_THEATERQ_USE_BYTEQ]);
     print_on_off(PRINT_ANY, "allow_gso", 
                  " allow_gso %s", tb[TCA_THEATERQ_ALLOW_GSO]);
+    print_on_off(PRINT_ANY, "apply_before_q", 
+                 " apply_before_q %s", tb[TCA_THEATERQ_APPLY_BEFORE_Q]);
     print_on_off(PRINT_ANY, "ecn", 
                  " ecn %s", tb[TCA_THEATERQ_ENABLE_ECN]);
 
@@ -409,6 +422,12 @@ static int theaterq_print_xstats(const struct qdisc_util *qu, FILE *f,
     print_u64(PRINT_FP, NULL, " %llup", stats->edfq_plen);
     print_u64(PRINT_JSON, "edfq_blen", NULL, stats->edfq_blen);
     print_u64(PRINT_JSON, "edfq_plen", NULL, stats->edfq_plen);
+
+    print_u64(PRINT_FP, NULL, " fifo %llub", stats->fifo_blen);
+    print_u64(PRINT_FP, NULL, " %llup", stats->fifo_plen);
+    print_u64(PRINT_JSON, "fifo_blen", NULL, stats->fifo_blen);
+    print_u64(PRINT_JSON, "fifo_plen", NULL, stats->fifo_plen);
+
     print_u64(PRINT_ANY, "looped", " looped %llu", stats->looped);
     print_string(PRINT_FP, NULL, " duration %s", 
                  sprint_time64(stats->total_time, b1));
