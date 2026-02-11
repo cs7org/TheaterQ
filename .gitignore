@@ -61,6 +61,7 @@ Module.symvers
 #
 !.gitignore
 !.mailmap
+!.gitlab-ci.yml
 
 #
 # Generated include files
