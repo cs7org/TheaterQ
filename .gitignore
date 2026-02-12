@@ -49,7 +49,8 @@ Module.symvers
 #
 # Debian directory (make deb-pkg)
 #
-/debian/
+/debian/package
+/debian/*.deb
 
 #
 # Local testbed stuff

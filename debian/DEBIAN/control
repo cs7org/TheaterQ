@@ -1,0 +1,8 @@
+Package: theaterq
+Version: 1.0
+Section: kernel
+Priority: optional
+Architecture: amd64
+Maintainer: Martin Ottens <martin.ottens@fau.de>
+Description: TheaterQ kernel module package
+Depends: kmod, iproute2

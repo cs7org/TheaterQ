@@ -1,0 +1,8 @@
+#!/bin/sh
+
+set -e
+
+echo "sch_theaterq" > /etc/modules-load.d/theaterq.conf
+
+depmod -a
+exit 0
