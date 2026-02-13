@@ -1046,7 +1046,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     // Always add the delay offset from a duplication event, only fill
     // the over fields when characteristics from packet arrival time are 
     // applied
-    cb->earliest_send_time = delay_offset;
+    cb->earliest_send_time = delay_offset + now;
     if (q->apply_before_q) {
         cb->earliest_send_time += get_pkt_delay(current_entry->latency, 
                                                 current_entry->jitter,
@@ -1057,6 +1057,12 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     // Enqueue into the fifo, scheduler will automatically call dequeue
     theaterq_fifo_enqueue(skb, q);
     sch->q.qlen++;
+
+    if (cb->earliest_send_time > q->t_busy_time && 
+        READ_ONCE(q->t_busy_time_scheduled) != q->t_busy_time) {
+                qdisc_watchdog_schedule_ns(&q->watchdog, q->t_busy_time);
+                WRITE_ONCE(q->t_busy_time_scheduled, q->t_busy_time);
+    }
 
     return NET_XMIT_SUCCESS;
 }
@@ -1200,7 +1206,7 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
                 skb_transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
             }
 
-            cb->earliest_send_time = now + skb_delay + skb_transmit_time;
+            cb->earliest_send_time = skb_delay + skb_transmit_time;
             theaterq_erase_head_fifo(q, skb);
             q->fifo_len--;
             q->fifo_blen -= qdisc_pkt_len(skb);
