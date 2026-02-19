@@ -1320,15 +1320,16 @@ deliver:
 }
 
 static const struct nla_policy theaterq_policy[TCA_THEATERQ_MAX + 1] = {
-    [TCA_THEATERQ_STAGE]        = { .type = NLA_U32 },
-    [TCA_THEATERQ_PRNG_SEED]    = { .type = NLA_U64 },
-    [TCA_THEATERQ_PKT_OVERHEAD] = { .type = NLA_S32 },
-    [TCA_THEATERQ_CONT_MODE]    = { .type = NLA_U32 },
-    [TCA_THEATERQ_INGEST_MODE]  = { .type = NLA_U32 },
-    [TCA_THEATERQ_SYNCGRP]      = { .type = NLA_S32 },
-    [TCA_THEATERQ_USE_BYTEQ]    = { .type = NLA_U8  },
-    [TCA_THEATERQ_ALLOW_GSO]    = { .type = NLA_U8  },
-    [TCA_THEATERQ_ENABLE_ECN]   = { .type = NLA_U8  },
+    [TCA_THEATERQ_STAGE]          = { .type = NLA_U32 },
+    [TCA_THEATERQ_PRNG_SEED]      = { .type = NLA_U64 },
+    [TCA_THEATERQ_PKT_OVERHEAD]   = { .type = NLA_S32 },
+    [TCA_THEATERQ_CONT_MODE]      = { .type = NLA_U32 },
+    [TCA_THEATERQ_INGEST_MODE]    = { .type = NLA_U32 },
+    [TCA_THEATERQ_SYNCGRP]        = { .type = NLA_S32 },
+    [TCA_THEATERQ_USE_BYTEQ]      = { .type = NLA_U8  },
+    [TCA_THEATERQ_APPLY_BEFORE_Q] = { .type = NLA_U8  },
+    [TCA_THEATERQ_ALLOW_GSO]      = { .type = NLA_U8  },
+    [TCA_THEATERQ_ENABLE_ECN]     = { .type = NLA_U8  },
 };
 
 static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,

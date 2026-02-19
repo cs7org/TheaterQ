@@ -43,10 +43,10 @@ static void explain(void)
                     "                    [cont {LOOP|HOLD|CLEAN}]\n"
                     "                    [byteqlen|pktqlen]\n"
                     "                    [allow_gso|prevent_gso]\n"
-                    "                    [apply_before_q|apply_after_q]\n"
+                    "                    [apply_beforeq|apply_afterq]\n"
                     "                    [ingest {SIMPLE|EXTENDED}]\n"
                     "                    [seed SEED]\n"
-                    "                    [ecn_enable_ecn|ecn_disable]\n"
+                    "                    [ecn_enable|ecn_disable]\n"
                     "                    [overhead PACKETOVERHEAD]\n"
                     "                    [syncgroup SYNCGROUP]\n");
 }
@@ -131,10 +131,10 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
         } else if (matches(*argv, "ecn_disable") == 0) {
             Q_THEATER_CHECK_FLAG(enable_ecn, "ECN");
             enable_ecn = 0;
-        } else if (matches(*argv, "apply_before_q") == 0) {
+        } else if (matches(*argv, "apply_beforeq") == 0) {
             Q_THEATER_CHECK_FLAG(apply_before_q, "Characteristics application");
             apply_before_q = 1;
-        } else if (matches(*argv, "apply_after_q") == 0) {
+        } else if (matches(*argv, "apply_afterq") == 0) {
             Q_THEATER_CHECK_FLAG(apply_before_q, "Characteristics application");
             apply_before_q = 0;
         } else if (matches(*argv, "seed") == 0) {
@@ -305,8 +305,8 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                  " bytequeue %s", tb[TCA_THEATERQ_USE_BYTEQ]);
     print_on_off(PRINT_ANY, "allow_gso", 
                  " allow_gso %s", tb[TCA_THEATERQ_ALLOW_GSO]);
-    print_on_off(PRINT_ANY, "apply_before_q", 
-                 " apply_before_q %s", tb[TCA_THEATERQ_APPLY_BEFORE_Q]);
+    print_on_off(PRINT_ANY, "apply_beforeq", 
+                 " apply_beforeq %s", tb[TCA_THEATERQ_APPLY_BEFORE_Q]);
     print_on_off(PRINT_ANY, "ecn", 
                  " ecn %s", tb[TCA_THEATERQ_ENABLE_ECN]);
 

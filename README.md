@@ -91,7 +91,7 @@ TheaterQ is used in the following way:
    The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length, `pktqlen` will switch it back to packets (default: packets).
    The `allow_gso`/`prevent_gso` flag disables/enables automatic GSO packet segmentation (default: disabled). 
    Use `ecn_enable`/`ecn_disbale` to configure whether RFC 3168 ECNs should be sent when queue length limit (*`<LIMIT>`*) is reached (default: disabled).
-   Use `apply_before_q`/`apply_after_q` to select whether link characteristics (delay, jitter, bandwidth limitations) should be applied before packets are enqueued into the FFO or after dequeuing. In the latter case, effects of link characteristics are delayed the amount of time a packet spends in the queue (in case of a single packet transmission, both settings will behave identical).
+   Use `apply_beforeq`/`apply_afterq` to select whether link characteristics (delay, jitter, bandwidth limitations) should be applied before packets are enqueued into the FFO or after dequeuing. In the latter case, effects of link characteristics are delayed the amount of time a packet spends in the queue (in case of a single packet transmission, both settings will behave identical).
    Use ``
 4. By using 
    ```bash
