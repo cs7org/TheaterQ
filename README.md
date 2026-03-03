@@ -35,11 +35,11 @@ TheaterQ expects two Trace File line formats:
 ```
 # Simple:
 <KEEP>,<LATENCY>,<RATE>,<LOSS>,<LIMIT>\n
-  u64     u64      u64    a)     u32
+  u64     u64      s64    a)     u32
 
 # Extended:
 <KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>,<ROUTE_ID>\n
-  u64     u64      u64      u64     a)    u32       a)         u64         b)
+  u64     u64      u64      s64     a)    u32       a)         u64         b)
 
 # Type hints:
 # a) Scaled u32: 0% = 0, 100% = U32_MAX
@@ -51,7 +51,7 @@ Lines starting with a non-numeric character are ignored.
 
 - **`KEEP`**: The time in µs how long this entry is kept active before continuing with the next Trace File entry. Entries with 0 time or large values (>= U64_MAX / 1000) are not allowed.
 - **`LATENCY`** and **`JITTER`**: Packet delay latency in ns with standard deviation.
-- **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second.
+- **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second. *-1* will allow TheaterQ to transmit without rate limitation.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format).
 - **`LIMIT`**: Currently available FIFO queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue. Should not contain the bandwidth-delay product of the link, as this is handled by a second queue.
 - **`DUP_PROB`** and **`DUP_DELAY`**: Probability for a packet to be duplicated, as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format). The duplicate will be statically delayed **`DUP_DELAY`** ns. A duplicated packet processed like any other, thus it is additionally affected by the `DELAY` and `JITTER`.
@@ -60,7 +60,7 @@ Duplicated packets with `DUP_DELAY` are not affected by the route ID.
 By default, 255 different routes are enabled, see [Module Parameters](#module-parameters) on how to increase this value during module load.
 
 On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
-Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering, as long as `ROUTE_ID` is not used.
+Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering, as long as `ROUTE_ID` is not used. Without an active `ROUTE_ID` it is also possible that TheaterQ exceeds the selected rate limit, e.g., when packets arrive with a short high delay spike while `RATE` is not changed.
 
 ## Usage
 Install the kernel module and set `TC_LIB_DIR`:
@@ -91,8 +91,6 @@ TheaterQ is used in the following way:
    The `byteqlen` option switches the queue length limit (*`<LIMIT>`*) from packets counts to packet byte length, `pktqlen` will switch it back to packets (default: packets).
    The `allow_gso`/`prevent_gso` flag disables/enables automatic GSO packet segmentation (default: disabled). 
    Use `ecn_enable`/`ecn_disbale` to configure whether RFC 3168 ECNs should be sent when queue length limit (*`<LIMIT>`*) is reached (default: disabled).
-   Use `apply_beforeq`/`apply_afterq` to select whether link characteristics (delay, jitter, bandwidth limitations) should be applied before packets are enqueued into the FFO or after dequeuing. In the latter case, effects of link characteristics are delayed the amount of time a packet spends in the queue (in case of a single packet transmission, both settings will behave identical).
-   Use ``
 4. By using 
    ```bash
    tc qdisc change dev <oif> root handle <major> theaterq stage LOAD

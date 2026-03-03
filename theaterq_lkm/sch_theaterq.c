@@ -99,17 +99,20 @@ struct theaterq_sched_data {
     struct sk_buff *edfq_head;
     struct sk_buff *edfq_tail;
 
+    // FIFO dequeue rate limiting
     u64 t_busy_time;
-    u64 t_busy_time_scheduled;
-    u64 t_busy_time_back;
+
+    // EDFQ lengths (for statistics)
     u32 edfq_len;
     u64 edfq_blen;
 
+    // FIFO lengths (for qlimit)
     u32 fifo_len;
     u64 fifo_blen;
 
     struct Qdisc *qdisc;
-    struct qdisc_watchdog watchdog;
+    struct qdisc_watchdog fifo_watchdog;
+    struct qdisc_watchdog edfq_watchdog;
 
     struct prng {
         u64 seed;
@@ -157,8 +160,8 @@ struct theaterq_sched_data {
     u64 t_updated;
 
     // State for route handling to prevent unwanted implicit packet 
-    // reordering within a route
-    u64 *r_last_send_times;
+    // reordering within a route and to limit rate per route
+    u64 *r_routes_busy;
 
     // Referencing back to the theaterq_syncgrps[] entry.
     // NULL = not a member of any snycgroup
@@ -184,12 +187,10 @@ static struct theaterq_syncgrp *theaterq_syncgrps = NULL;
 
 // Maximum cb size is 16 bytes
 struct theaterq_skb_cb {
-    // Used at two stages:
-    // FIFO: Delay offset
-    // EDFQ: Send time of a skb: arrive_time + delays
+    // Send time of a skb: arrive_time + delays (+ reorder prevention)
     u64 earliest_send_time;
-    // Transmit duration of a skb
-    u64 transmit_time;
+    // Delay offset for packet duplication, set before FIFO enqueue
+    u64 delay_offset;
 };
 
 // SYNC GROUPS =================================================================
@@ -532,11 +533,9 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     q->e_current = 0;
     q->e_progresstime = 0;
     q->t_busy_time = 0;
-    q->t_busy_time_back = 0;
-    q->t_busy_time_scheduled = 0;
     q->stage = THEATERQ_STAGE_RUN;
     q->t_updated = now;
-    memset(q->r_last_send_times, (reorder_routes + 1) * sizeof(u64), 0);
+    memset(q->r_routes_busy, (reorder_routes + 1) * sizeof(u64), 0);
     WRITE_ONCE(q->current_entry, q->e_head);
 
     return 0;
@@ -957,8 +956,6 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
                     theaterq_stop_replay(q, true);
                     q->e_progresstime = 0;
                     q->t_busy_time = 0;
-                    q->t_busy_time_back = 0;
-                    q->t_busy_time_scheduled = 0;
                     q->stage = THEATERQ_STAGE_FINISH;
                     UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
                     return current_entry;
@@ -1064,7 +1061,7 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     cb = theaterq_skb_cb(skb);
 
     // Always add the delay offset from a duplication event
-    cb->earliest_send_time = delay_offset;
+    cb->delay_offset = delay_offset;
 
     // Enqueue into the fifo, scheduler will automatically call dequeue
     theaterq_fifo_enqueue(skb, q);
@@ -1192,23 +1189,21 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
             // (e.g., when edfq entries can be dequeued)
             // qdisc_watchdog_schedule_ns will prevent multiple entries
             // for a given time frame, but we will shortcut this check
-            if (READ_ONCE(q->t_busy_time_scheduled) != q->t_busy_time) {
-                qdisc_watchdog_schedule_ns(&q->watchdog, q->t_busy_time);
-                WRITE_ONCE(q->t_busy_time_scheduled, q->t_busy_time);
-            }
+            qdisc_watchdog_schedule_ns(&q->fifo_watchdog, q->t_busy_time);
+
 
             break;
         } else {
             // Link is available, dequeue skb and calculate all required
             // values if not yet happened. Dequeue skb from fifo
             struct theaterq_skb_cb *cb = theaterq_skb_cb(skb);
-            u64 skb_delay = cb->earliest_send_time;
+            u64 skb_delay = cb->delay_offset;
             u64 skb_transmit_time = packet_time_ns(qdisc_pkt_len(skb), q);
 
             if (skb_transmit_time == 0ULL && !is_rate_unlimited(q)) {
                 u64 next_try = theaterq_get_next_entry_delay(q, now);
                 if (next_try) {
-                    qdisc_watchdog_schedule_ns(&q->watchdog, now + next_try);
+                    qdisc_watchdog_schedule_ns(&q->fifo_watchdog, now + next_try);
                     break;
                 }
             }
@@ -1216,8 +1211,7 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
             skb_delay += get_pkt_delay(current_entry->latency, 
                                        current_entry->jitter,
                                        &q->prng);
-            
-            cb->transmit_time = skb_transmit_time;
+            // Delay is t_prop, so FIFO sojourn time is not included
             cb->earliest_send_time = now + skb_transmit_time + skb_delay;
         
             theaterq_erase_head_fifo(q, skb);
@@ -1225,31 +1219,23 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
             q->fifo_blen -= qdisc_pkt_len(skb);
             skb->next = NULL;
             skb->prev = NULL;
-            
-            // Check reordering state of skb, enforce strict order 
-            // when required
-            if (cb->earliest_send_time <= q->r_last_send_times[current_entry->route_id])
-                cb->earliest_send_time = q->r_last_send_times[current_entry->route_id] + 1;
 
-            if (current_entry->route_id != THEATERQ_ALLOW_IMPLICIT_REORDER)
-                q->r_last_send_times[current_entry->route_id] = cb->earliest_send_time;
+            // If a route_id is set: ensure strict reordering and enforce bandwidth
+            // limitation of that route based on the packet's current transmit_time
+            if (current_entry->route_id != THEATERQ_ALLOW_IMPLICIT_REORDER) {
+                if (cb->earliest_send_time <= q->r_routes_busy[current_entry->route_id]) {
+                    cb->earliest_send_time = q->r_routes_busy[current_entry->route_id];
+                    q->r_routes_busy[current_entry->route_id] += skb_transmit_time;
+                } else {
+                    q->r_routes_busy[current_entry->route_id] = cb->earliest_send_time;
+                }
+            }
 
-            // Enqueue into edfq and schedule next event: There are two 
-            // cases for this:
-            // - The send_time of the first skb in edfq is higher, the
-            //   current skb overtook all others -> reschedule to the
-            //   send_time of the new skb. When it has not overtaken,
-            //   edfq dequeing will deal with the timer
-            // - Another skb is present in fifo: Make sure, that it is 
-            //   dequeued when the link becomes available again
+            // Enqueue into edfq, whenever this loop finsihes, the edfq_dequeue
+            // will always check if a new packet can be dequeued or reschedule
+            // the dequeue, when required
             theaterq_edfq_enqueue(skb, q);
             WRITE_ONCE(q->t_busy_time, now + skb_transmit_time);
-            /*struct sk_buff *first = theaterq_peek_edfq(q);
-            if (first) {
-                u64 first_send_time = theaterq_skb_cb(first)->earliest_send_time;
-                if (first_send_time > cb->earliest_send_time)
-                    qdisc_watchdog_schedule_ns(&q->watchdog, cb->earliest_send_time);
-            }*/
         }
     }
 
@@ -1265,7 +1251,7 @@ deliver:
 
     skb = theaterq_peek_edfq(q);
     if (skb) {
-        // Each enqueued skb in edfq has an earliest_send_time values. 
+        // Each enqueued skb in edfq has a earliest_send_time value: 
         // The next skb dequeued is always the skb with the lowest 
         // earliest_send_time, but it can only be sent when: 
         // earliest_send_time >= now
@@ -1274,9 +1260,7 @@ deliver:
         u64 earliest_send_time = theaterq_skb_cb(skb)->earliest_send_time;
         unsigned int pkt_len = qdisc_pkt_len(skb);
 
-        if (earliest_send_time <= now && q->t_busy_time_back <= now) {
-            WRITE_ONCE(q->t_busy_time_back, now + theaterq_skb_cb(skb)->transmit_time);
-
+        if (earliest_send_time <= now) {
             theaterq_erase_head_edfq(q, skb);
             q->edfq_len--;
             q->edfq_blen -= pkt_len;
@@ -1309,9 +1293,9 @@ deliver:
             sch->q.qlen--;
             goto deliver;
         }
-
-        qdisc_watchdog_schedule_ns(&q->watchdog, 
-                                   max(earliest_send_time, q->t_busy_time_back));
+        
+        // Call theaterq_dequeue again when the next skb can be transmitted
+        qdisc_watchdog_schedule_ns(&q->edfq_watchdog, earliest_send_time);
 
         // Always send skbs dequeued from the child qdisc
         if (q->qdisc) {
@@ -1461,10 +1445,10 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
-    q->r_last_send_times = kmalloc((reorder_routes + 1) * sizeof(u64), 
+    q->r_routes_busy = kmalloc((reorder_routes + 1) * sizeof(u64), 
                                    GFP_KERNEL);
 
-    if (!q->r_last_send_times) {
+    if (!q->r_routes_busy) {
         printk(KERN_ERR "theaterq: Unable to allocate memory for reorder route cache.\n");
         return -ENOMEM;
     }
@@ -1485,7 +1469,8 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->deletion_pending = false;
 
     spin_lock_init(&q->e_lock);
-    qdisc_watchdog_init(&q->watchdog, sch);
+    qdisc_watchdog_init(&q->fifo_watchdog, sch);
+    qdisc_watchdog_init(&q->edfq_watchdog, sch);
 
     if (!opt) return -EINVAL;
 
@@ -1515,17 +1500,18 @@ static void theaterq_reset(struct Qdisc *sch)
     q->stage = THEATERQ_STAGE_LOAD;
     theaterq_stats_clear(&q->stats);
     q->t_busy_time = 0;
-    q->t_busy_time_back = 0;
     if (q->qdisc) qdisc_reset(q->qdisc);
-    qdisc_watchdog_cancel(&q->watchdog);
+    qdisc_watchdog_cancel(&q->fifo_watchdog);
+    qdisc_watchdog_cancel(&q->edfq_watchdog);
 }
 
 static void theaterq_destroy(struct Qdisc *sch)
 {
     struct theaterq_sched_data *q = qdisc_priv(sch);
-    qdisc_watchdog_cancel(&q->watchdog);
+    qdisc_watchdog_cancel(&q->fifo_watchdog);
+    qdisc_watchdog_cancel(&q->edfq_watchdog);
     theaterq_syncgroup_leave(q);
-    kfree(q->r_last_send_times);
+    kfree(q->r_routes_busy);
     destroy_ingest_cdev(sch);
     // enqueue will not be called again here
     entry_list_clear(q);
