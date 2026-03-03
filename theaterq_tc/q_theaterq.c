@@ -21,6 +21,7 @@ along with this program; If not, see <http://www.gnu.org/licenses/>.
 #include <unistd.h>
 #include <string.h>
 #include <inttypes.h>
+#include <math.h>
 
 #include <uapi/linux/pkt_sch_theaterq.h>
 
@@ -43,7 +44,6 @@ static void explain(void)
                     "                    [cont {LOOP|HOLD|CLEAN}]\n"
                     "                    [byteqlen|pktqlen]\n"
                     "                    [allow_gso|prevent_gso]\n"
-                    "                    [apply_beforeq|apply_afterq]\n"
                     "                    [ingest {SIMPLE|EXTENDED}]\n"
                     "                    [seed SEED]\n"
                     "                    [ecn_enable|ecn_disable]\n"
@@ -67,7 +67,6 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
     __s32 syncgroup = -1;
     __u8 use_byteq = Q_THEATERQ_FLAG_NOT_SET; 
     __u8 allow_gso = Q_THEATERQ_FLAG_NOT_SET;
-    __u8 apply_before_q = Q_THEATERQ_FLAG_NOT_SET;
     __u8 enable_ecn = Q_THEATERQ_FLAG_NOT_SET;
     bool has_seed = false;
     bool has_syncgroup = false;
@@ -131,12 +130,6 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
         } else if (matches(*argv, "ecn_disable") == 0) {
             Q_THEATER_CHECK_FLAG(enable_ecn, "ECN");
             enable_ecn = 0;
-        } else if (matches(*argv, "apply_beforeq") == 0) {
-            Q_THEATER_CHECK_FLAG(apply_before_q, "Characteristics application");
-            apply_before_q = 1;
-        } else if (matches(*argv, "apply_afterq") == 0) {
-            Q_THEATER_CHECK_FLAG(apply_before_q, "Characteristics application");
-            apply_before_q = 0;
         } else if (matches(*argv, "seed") == 0) {
             NEXT_ARG();
             has_seed = true;
@@ -199,9 +192,6 @@ static int theaterq_parse_opt(const struct qdisc_util *qu, int argc,
             return -1;
     if (allow_gso != Q_THEATERQ_FLAG_NOT_SET &&
         addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &allow_gso, sizeof(allow_gso)) < 0)
-            return -1;
-    if (apply_before_q != Q_THEATERQ_FLAG_NOT_SET &&
-        addattr_l(n, 2048, TCA_THEATERQ_APPLY_BEFORE_Q, &apply_before_q, sizeof(apply_before_q)) < 0)
             return -1;
     if (enable_ecn != Q_THEATERQ_FLAG_NOT_SET &&
         addattr_l(n, 2048, TCA_THEATERQ_ALLOW_GSO, &enable_ecn, sizeof(enable_ecn)) < 0)
@@ -305,8 +295,6 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                  " bytequeue %s", tb[TCA_THEATERQ_USE_BYTEQ]);
     print_on_off(PRINT_ANY, "allow_gso", 
                  " allow_gso %s", tb[TCA_THEATERQ_ALLOW_GSO]);
-    print_on_off(PRINT_ANY, "apply_beforeq", 
-                 " apply_beforeq %s", tb[TCA_THEATERQ_APPLY_BEFORE_Q]);
     print_on_off(PRINT_ANY, "ecn", 
                  " ecn %s", tb[TCA_THEATERQ_ENABLE_ECN]);
 
@@ -369,8 +357,12 @@ static int theaterq_print_opt(const struct qdisc_util *qu, FILE *f,
                              sprint_time64(entry_current->jitter, b1));
         }
 
-        if (entry_current->rate || is_json_context())
-            tc_print_rate(PRINT_ANY, "rate", " rate %s", entry_current->rate);
+        if (entry_current->rate || is_json_context()) {
+            if (entry_current->rate < 0)
+                print_float(PRINT_ANY, "rate", " rate %f", INFINITY);
+            else
+                tc_print_rate(PRINT_ANY, "rate", " rate %s", entry_current->rate);
+        }
         
         print_float(PRINT_JSON, "loss", NULL, 
                     (1. * entry_current->loss) / UINT32_MAX);

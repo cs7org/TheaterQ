@@ -63,7 +63,6 @@ enum {
     TCA_THEATERQ_SYNCGRP,
     TCA_THEATERQ_USE_BYTEQ,
     TCA_THEATERQ_ALLOW_GSO,
-    TCA_THEATERQ_APPLY_BEFORE_Q,
     TCA_THEATERQ_ENABLE_ECN,
     TCA_THEATERQ_INGEST_MODE,
     TCA_THEATERQ_INGEST_CDEV,
@@ -80,7 +79,7 @@ struct theaterq_entry {
     __u64 keep;
     __u64 latency;
     __u64 jitter;
-    __u64 rate;
+    __s64 rate;
     __u32 loss;
     __u32 limit;
     __u32 dup_prob;
