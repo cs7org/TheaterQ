@@ -38,12 +38,13 @@ TheaterQ expects two Trace File line formats:
   u64     u64      s64    a)     u32
 
 # Extended:
-<KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>,<ROUTE_ID>\n
-  u64     u64      u64      s64     a)    u32       a)         u64         b)
+<KEEP>,<LATENCY>,<JITTER>,<RATE>,<LOSS>,<LIMIT>,<DUP_PROB>,<DUP_DELAY>,<ROUTE_ID>,<QUEUE_ID>\n
+  u64     u64      u64      s64     a)    u32       a)         u64         b)          c)
 
 # Type hints:
 # a) Scaled u32: 0% = 0, 100% = U32_MAX
-# b) u32 limited by reorder_routes kernel module options (default max is 244), 0 is reserved
+# b) u32 limited by reorder_routes kernel module options (default max is 255), 0 is reserved
+# c) u32 limited by bottleneck_fifos kernel module options (default max is 255)
 ```
 Types are identical in both formats. 
 Default format is `SIMPLE`, during creation of a TheaterQ qdisc instance the format can be set to `EXTENDED` by using the `ingest EXTENDED` option.
@@ -53,11 +54,14 @@ Lines starting with a non-numeric character are ignored.
 - **`LATENCY`** and **`JITTER`**: Packet delay latency in ns with standard deviation.
 - **`RATE`**: Adds a packet size based delay to each packet to emulate fixed link speeds, rate is given in bits per second. *-1* will allow TheaterQ to transmit without rate limitation.
 - **`LOSS`**: Probability for a packet loss as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format).
-- **`LIMIT`**: Currently available FIFO queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue. Should not contain the bandwidth-delay product of the link, as this is handled by a second queue.
+- **`LIMIT`**: Currently available FIFO queue size as number of packets (or in bytes, depending on configuration). Packets that cannot be enqueued will be dropped. Once enqueued packets are always dequeued, changing the limit will not delete packets from the queue. Should not contain the bandwidth-delay product of the link, as this is handled by a second queue. See also `QUEUE_ID` for details.
 - **`DUP_PROB`** and **`DUP_DELAY`**: Probability for a packet to be duplicated, as a scaled 32bit integer value (0% = 0, 100% = `U32_MAX`, 0 in simple format). The duplicate will be statically delayed **`DUP_DELAY`** ns. A duplicated packet processed like any other, thus it is additionally affected by the `DELAY` and `JITTER`.
 - **`ROUTE_ID`**: Allow implicit packet reordering only when the route through the network changes. Packets transmitted with the same route ID will not implicitly reorder (e.g. due to delay changes or when jitter is high). Packets transmitted without route ID changes will be transmitted strictly in arrival order, only during changes of the route ID implicit packet reordering is possible. Use 0 (default in simple format) to always allow implicit packet reordering.
 Duplicated packets with `DUP_DELAY` are not affected by the route ID.
-By default, 255 different routes are enabled, see [Module Parameters](#module-parameters) on how to increase this value during module load.
+By default, 255 different routes are possible, see [Module Parameters](#module-parameters) on how to increase this value during module load.
+- **`QUEUE_ID`**: Inside TheaterQ one FIFO queue is used to handle the `LIMIT` characteristic (queue size before the bottleneck link). When this bottleneck changes, another queue can become the relevant one, which has a reduced occupancy and might be smaller. The queue ID allows to track the capacity of multiple queues that are handled within the single FIFO. Packets are therefore never reordered due to a changing queue ID, but unexpected drops when the active queue before the bottleneck changed, unexpected packet drops can be prevented. Use a static value for `QUEUE_ID` to disable this feature.
+By default, 255 different queues are possible, see [Module Parameters](#module-parameters) on how to increase this value during module load.
+The FIFO queue statistics are not considering these routes, thus, the total FIFO size is always returned, which could be higher than `LIMIT`.
 
 On parsing errors, the chardev will return *EINVAL* and an error message will be visible in `dmesg`.
 Please note that rapid changes of the `LATENCY` values or high `JITTER` values will lead to implicit packet reordering, as long as `ROUTE_ID` is not used. Without an active `ROUTE_ID` it is also possible that TheaterQ exceeds the selected rate limit, e.g., when packets arrive with a short high delay spike while `RATE` is not changed.
@@ -136,13 +140,14 @@ Important values:
 The kernel module can be configured during loading with the following parameters:
 - `syncgrps`: Maximum number of syncgroups (u8, default = 8)
 - `syncgrps_members`: Maximum number of members in each syncgroup (u8, default = 8)
-- `reorder_routes`: Number of different reorder routes (each reorder routes internally tracks an u64 timestamp, static memory allocation for each theaterq instance: *reorder_routes * 8 bytes*). The *ROUTE_ID* in the extended format cannot be larger than this value (u16, default = 255)
+- `reorder_routes`: Number of different reorder routes (each reorder routes internally tracks an u64 timestamp, static memory allocation for each TheaterQ instance: *reorder_routes * 8 bytes*). The *ROUTE_ID* in the extended format cannot be larger than this value (u16, default = 255)
+- `bottleneck_fifos`: Number of different virtual FIFO queue capacity counters (each counter internally tracks an u64 counter, static memory allocation for each TheaterQ instance: *bottleneck_fifos * 8 bytes*). The *QUEUE_ID* in the extended format cannot be larger than this value (u16, default = 255)
 
 Example:
 ```bash
-sudo insmod sch_theaterq.ko syncgrps=16 syncgrps_members=16 reorder_routes=1024
+sudo insmod sch_theaterq.ko syncgrps=16 syncgrps_members=16 reorder_routes=1024 bottleneck_fifos=512
 ```
-Check the current configuration using `cat /sys/module/sch_theaterq/parameters/{syncgrps,syncgrps_members,reorder_routes}`. Parameter settings cannot be changed while the module is loaded.
+Check the current configuration using `cat /sys/module/sch_theaterq/parameters/{syncgrps,syncgrps_members,reorder_routes,bottleneck_fifos}`. Parameter settings cannot be changed while the module is loaded.
 
 ## License
 This project is licensed under the [GNU General Public License v2.0](LICENSE). For more details, see the `LICENSE` file or see https://www.gnu.org/licenses/.

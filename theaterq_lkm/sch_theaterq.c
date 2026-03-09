@@ -51,6 +51,7 @@ along with this program; If not, see <http://www.gnu.org/licenses/>.
 #define THEATERQ_NS_PER_US 1000
 #define THEATERQ_NO_EXPIRY U64_MAX
 #define THEATERQ_ALLOW_IMPLICIT_REORDER 0
+#define THEATERQ_SINGLE_QUEUE_OCCUPANCY 0
 
 // Slab allocator for Trace File entries of all instances
 static struct kmem_cache *theaterq_cache = NULL;
@@ -60,6 +61,7 @@ static DEFINE_SPINLOCK(theaterq_tree_lock);
 static u8 syncgrps = 8;
 static u8 syncgrps_members = 8;
 static u16 reorder_routes = 255;
+static u16 bottleneck_fifos = 255;
 
 static const struct theaterq_entry theaterq_default_entry = {
     .keep = THEATERQ_NO_EXPIRY,
@@ -71,6 +73,7 @@ static const struct theaterq_entry theaterq_default_entry = {
     .dup_prob = 0UL,
     .dup_delay = 0ULL,
     .route_id = 0UL,
+    .queue_id = 0UL,
     .next = NULL,
 };
 
@@ -163,6 +166,9 @@ struct theaterq_sched_data {
     // reordering within a route and to limit rate per route
     u64 *r_routes_busy;
 
+    // Counters for per-fifo queue occupancy
+    u64 *r_fifo_occupancy;
+
     // Referencing back to the theaterq_syncgrps[] entry.
     // NULL = not a member of any snycgroup
     struct theaterq_syncgrp *syncgrp;
@@ -187,8 +193,15 @@ static struct theaterq_syncgrp *theaterq_syncgrps = NULL;
 
 // Maximum cb size is 16 bytes
 struct theaterq_skb_cb {
-    // Send time of a skb: arrive_time + delays (+ reorder prevention)
-    u64 earliest_send_time;
+    union {
+        // Used while skb is in fifo
+        // Queue id where this skb is counted to during enqueue 
+        // for correct decrement during dequeue
+        u32 accounted_in_fifo;
+        // Used while skb is in edfq
+        // Send time of a skb: arrive_time + delays (+ reorder prevention)
+        u64 earliest_send_time;
+    };
     // Delay offset for packet duplication, set before FIFO enqueue
     u64 delay_offset;
 };
@@ -269,7 +282,7 @@ static int theaterq_syncgroup_startall(struct theaterq_sched_data *q)
 
         int errno = theaterq_start_replay(instance, now);
         if (errno) {
-            printk(KERN_WARNING "theaterq: Unable to start member %i in "
+            printk(KERN_WARNING "sch_theaterq: Unable to start member %i in "
                                 "syncgroup %d: %d\n", i, grp, errno);
             ret = errno;
         }
@@ -286,13 +299,13 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
         return true;
 
     if (grp < THEATERQ_SYNCGROUP_LEAVE) {
-        printk(KERN_WARNING "theaterq: Invalid syncgroup: Must be %d or "
+        printk(KERN_WARNING "sch_theaterq: Invalid syncgroup: Must be %d or "
                             "positive.\n", THEATERQ_SYNCGROUP_LEAVE);
         return false;
     }
 
     if (grp >= syncgrps) {
-        printk(KERN_WARNING "theaterq: Maximum syncgroup index is %d\n", 
+        printk(KERN_WARNING "sch_theaterq: Maximum syncgroup index is %d\n", 
                syncgrps - 1);
         return false;
     }
@@ -308,7 +321,7 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
         } else {
             u32 otherstage = theaterq_syncgrps[grp].members[i]->stage;
             if (otherstage != THEATERQ_STAGE_LOAD && otherstage != THEATERQ_STAGE_FINISH) {
-                printk(KERN_WARNING "theaterq: Cannot join a syncgroup with "
+                printk(KERN_WARNING "sch_theaterq: Cannot join a syncgroup with "
                                     "running/armed members\n");
                 goto fail_unlock;
             }
@@ -316,7 +329,7 @@ static bool theaterq_syncgroup_join(struct theaterq_sched_data *q, s32 grp)
     }
 
     if (free_index == -1) {
-        printk(KERN_WARNING "theaterq: Selected syncgroup is full.\n");
+        printk(KERN_WARNING "sch_theaterq: Selected syncgroup is full.\n");
         goto fail_unlock;
     }
 
@@ -532,7 +545,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     
     q->e_current = 0;
     q->e_progresstime = 0;
-    q->t_busy_time = 0;
+    q->t_busy_time = 0ULL;
     q->stage = THEATERQ_STAGE_RUN;
     q->t_updated = now;
     memset(q->r_routes_busy, (reorder_routes + 1) * sizeof(u64), 0);
@@ -703,6 +716,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 PARSE_TOKEN_EXTENDED(kstrtou64, &entry->dup_delay, 0);
                 PARSE_TOKEN_EXTENDED(kstrtou32, &entry->route_id, 
                                      THEATERQ_ALLOW_IMPLICIT_REORDER);
+                PARSE_TOKEN_EXTENDED(kstrtou32, &entry->queue_id,
+                                     THEATERQ_SINGLE_QUEUE_OCCUPANCY);
 
 #undef PARSE_TOKEN_EXTENDED
 #undef PARSE_TOKEN
@@ -739,6 +754,14 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                     printk(KERN_WARNING 
                            "sch_theaterq: Reorder route index is too large, max is %d!\n",
                             reorder_routes);
+                    ret = -EINVAL;
+                    goto cleanup_failed_entry;
+                }
+
+                if (entry->queue_id > bottleneck_fifos) {
+                    printk(KERN_WARNING
+                           "sch_theaterq: Queue id is to large, max is %d!\n",
+                            bottleneck_fifos);
                     ret = -EINVAL;
                     goto cleanup_failed_entry;
                 }
@@ -955,7 +978,7 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
                     // possible u64 overflows
                     theaterq_stop_replay(q, true);
                     q->e_progresstime = 0;
-                    q->t_busy_time = 0;
+                    q->t_busy_time = 0ULL;
                     q->stage = THEATERQ_STAGE_FINISH;
                     UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
                     return current_entry;
@@ -1046,8 +1069,10 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
                 skb_orphan_partial(skb);
     }
 
-    check_len = q->use_byte_queue ?
-                    q->fifo_blen + qdisc_pkt_len(skb) : q->fifo_len;
+    // Get the corresponding fifo counter
+    check_len = q->r_fifo_occupancy[current_entry->queue_id];
+    if (q->use_byte_queue)
+        check_len += qdisc_pkt_len(skb);
 
     if (unlikely(current_entry->limit && check_len >= current_entry->limit)) {
         if (q->enable_ecn)
@@ -1056,6 +1081,12 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
         qdisc_drop_all(skb, sch, to_free);
         return NET_XMIT_SUCCESS | __NET_XMIT_BYPASS;
     }
+
+    // Increase the corresponding fifo counter, cb->accounted_in_fifo is
+    // shared memory with cb->earliest_send_time used while the skb is
+    // enqueued in edfq.
+    q->r_fifo_occupancy[current_entry->queue_id] += q->use_byte_queue ? qdisc_pkt_len(skb) : 1;
+    cb->accounted_in_fifo = current_entry->queue_id;
 
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
@@ -1208,17 +1239,22 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
                 }
             }
 
-            skb_delay += get_pkt_delay(current_entry->latency, 
-                                       current_entry->jitter,
-                                       &q->prng);
-            // Delay is t_prop, so FIFO sojourn time is not included
-            cb->earliest_send_time = now + skb_transmit_time + skb_delay;
-        
             theaterq_erase_head_fifo(q, skb);
             q->fifo_len--;
             q->fifo_blen -= qdisc_pkt_len(skb);
             skb->next = NULL;
             skb->prev = NULL;
+
+            // Decrease the corressponding fifo counter, do it here before
+            // cb->accounted_in_fifo is overwritten by cb->earliest_send_time
+            q->r_fifo_occupancy[cb->accounted_in_fifo] -= q->use_byte_queue ? qdisc_pkt_len(skb) : 1;
+
+            skb_delay += get_pkt_delay(current_entry->latency, 
+                                       current_entry->jitter,
+                                       &q->prng);
+            // Delay is t_prop, so FIFO sojourn time is not included
+            cb->earliest_send_time = now + skb_transmit_time + skb_delay;
+    
 
             // If a route_id is set: ensure strict reordering and enforce bandwidth
             // limitation of that route based on the packet's current transmit_time
@@ -1355,8 +1391,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
             new_stage = THEATERQ_STAGE_LOAD;
 
         if (new_stage == THEATERQ_STAGE_CLEAR) {
-            q->t_busy_time = 0;
-            q->t_busy_time = 0;
+            q->t_busy_time = 0ULL;
             new_stage = THEATERQ_STAGE_LOAD;
             q->deletion_pending = true;
             start_replay = THEATERQ_REPLAY_STOP | THEATERQ_REPLAY_CLEAR;
@@ -1369,7 +1404,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
             if (!q->e_entries) {
                 ret = -ENODATA;
                 printk(KERN_WARNING 
-                       "theaterq: Unable to run without entries!\n");
+                       "sch_theaterq: Unable to run without entries!\n");
                 goto err_out;
             }
 
@@ -1449,9 +1484,19 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
                                    GFP_KERNEL);
 
     if (!q->r_routes_busy) {
-        printk(KERN_ERR "theaterq: Unable to allocate memory for reorder route cache.\n");
+        printk(KERN_ERR "sch_theaterq: Unable to allocate memory for reorder route cache.\n");
         return -ENOMEM;
     }
+
+    q->r_fifo_occupancy = kmalloc((bottleneck_fifos + 1) * sizeof(u64),
+                                    GFP_KERNEL);
+    if (!q->r_fifo_occupancy) {
+        printk(KERN_ERR "sch_theaterq: Unable to allocate memory for fifo occupancy counters.\n");
+        kfree(q->r_routes_busy);
+        return -ENOMEM;
+    }
+
+    memset(q->r_fifo_occupancy, (reorder_routes + 1) * sizeof(u64), 0);
 
     // We will manage our queue sizes ourselves
     sch->limit = __UINT32_MAX__;
@@ -1463,7 +1508,6 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->allow_gso = false;
     q->syncgrp = NULL;
     q->isdup = false;
-    q->t_busy_time = 0ULL;
     q->t_busy_time = 0ULL;
     q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
@@ -1494,12 +1538,13 @@ static void theaterq_reset(struct Qdisc *sch)
     qdisc_reset_queue(sch);
     theaterq_edfq_reset(sch);
     theaterq_fifo_reset(sch);
+    memset(q->r_fifo_occupancy, (reorder_routes + 1) * sizeof(u64), 0);
     // Leave the syncgroup but do not stop the other members
     theaterq_syncgroup_leave(q);
     theaterq_stop_replay(q, true);
     q->stage = THEATERQ_STAGE_LOAD;
     theaterq_stats_clear(&q->stats);
-    q->t_busy_time = 0;
+    q->t_busy_time = 0ULL;
     if (q->qdisc) qdisc_reset(q->qdisc);
     qdisc_watchdog_cancel(&q->fifo_watchdog);
     qdisc_watchdog_cancel(&q->edfq_watchdog);
@@ -1512,6 +1557,7 @@ static void theaterq_destroy(struct Qdisc *sch)
     qdisc_watchdog_cancel(&q->edfq_watchdog);
     theaterq_syncgroup_leave(q);
     kfree(q->r_routes_busy);
+    kfree(q->r_fifo_occupancy);
     destroy_ingest_cdev(sch);
     // enqueue will not be called again here
     entry_list_clear(q);
@@ -1712,6 +1758,10 @@ module_param(reorder_routes, short, S_IRUSR | S_IRGRP | S_IROTH);
 MODULE_PARM_DESC(reorder_routes, 
                  "Number of different reorder routes to keep track of (u16, default=255)");
 
+module_param(bottleneck_fifos, short, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(bottleneck_fifos,
+                 "Number of different bottlneck fifo occupancy counters (u16, default=255)");
+
 static int __init sch_theaterq_init(void)
 {
     theaterq_cache = kmem_cache_create("theaterq_cache",
@@ -1719,7 +1769,7 @@ static int __init sch_theaterq_init(void)
                                        0, SLAB_HWCACHE_ALIGN, NULL);
     
     if (!theaterq_cache) {
-        printk(KERN_ERR "theaterq: Unable to create slab allocator\n");
+        printk(KERN_ERR "sch_theaterq: Unable to create slab allocator\n");
         return -ENOMEM;
     }
 
@@ -1728,7 +1778,7 @@ static int __init sch_theaterq_init(void)
                                      GFP_KERNEL);
 
     if (!theaterq_syncgrps) {
-        printk(KERN_ERR "theaterq: Unable kmalloc for syncgroups\n");
+        printk(KERN_ERR "sch_theaterq: Unable kmalloc for syncgroups\n");
         kmem_cache_destroy(theaterq_cache);
         theaterq_cache = NULL;
         return -ENOMEM;
