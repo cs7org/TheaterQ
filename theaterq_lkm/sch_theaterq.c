@@ -1086,13 +1086,13 @@ static int theaterq_enqueue_seg(struct sk_buff *skb, struct Qdisc *sch,
     // shared memory with cb->earliest_send_time used while the skb is
     // enqueued in edfq.
     q->r_fifo_occupancy[current_entry->queue_id] += q->use_byte_queue ? qdisc_pkt_len(skb) : 1;
-    cb->accounted_in_fifo = current_entry->queue_id;
 
     qdisc_qstats_backlog_inc(sch, skb);
     cb = theaterq_skb_cb(skb);
 
     // Always add the delay offset from a duplication event
     cb->delay_offset = delay_offset;
+    cb->accounted_in_fifo = current_entry->queue_id;
 
     // Enqueue into the fifo, scheduler will automatically call dequeue
     theaterq_fifo_enqueue(skb, q);
