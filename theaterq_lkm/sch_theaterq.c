@@ -104,6 +104,7 @@ struct theaterq_sched_data {
 
     // FIFO dequeue rate limiting
     u64 t_busy_time;
+    bool t_busy_backlog; // FIFO was not empty when t_busy_time was set
 
     // EDFQ lengths (for statistics)
     u32 edfq_len;
@@ -546,6 +547,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     q->e_current = 0;
     q->e_progresstime = 0;
     q->t_busy_time = 0ULL;
+    q->t_busy_backlog = false;
     q->stage = THEATERQ_STAGE_RUN;
     q->t_updated = now;
     memset(q->r_routes_busy, (reorder_routes + 1) * sizeof(u64), 0);
@@ -979,6 +981,7 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
                     theaterq_stop_replay(q, true);
                     q->e_progresstime = 0;
                     q->t_busy_time = 0ULL;
+                    q->t_busy_backlog = false;
                     q->stage = THEATERQ_STAGE_FINISH;
                     UPDATE_PRIV_LOCAL((struct theaterq_entry *) &theaterq_default_entry);
                     return current_entry;
@@ -1252,8 +1255,12 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
             skb_delay += get_pkt_delay(current_entry->latency, 
                                        current_entry->jitter,
                                        &q->prng);
+            // A packet already waiting when the link became free starts at
+            // t_busy_time, not at the (late) watchdog wake-up
+            u64 start = q->t_busy_backlog ? READ_ONCE(q->t_busy_time) : now;
+
             // Delay is t_prop, so FIFO sojourn time is not included
-            cb->earliest_send_time = now + skb_transmit_time + skb_delay;
+            cb->earliest_send_time = start + skb_transmit_time + skb_delay;
     
 
             // If a route_id is set: ensure strict reordering and enforce bandwidth
@@ -1271,7 +1278,8 @@ static struct sk_buff *theaterq_dequeue(struct Qdisc *sch)
             // will always check if a new packet can be dequeued or reschedule
             // the dequeue, when required
             theaterq_edfq_enqueue(skb, q);
-            WRITE_ONCE(q->t_busy_time, now + skb_transmit_time);
+            WRITE_ONCE(q->t_busy_time, start + skb_transmit_time);
+            q->t_busy_backlog = theaterq_peek_fifo(q) != NULL;
         }
     }
 
@@ -1392,6 +1400,7 @@ static int theaterq_change(struct Qdisc *sch, struct nlattr *opt,
 
         if (new_stage == THEATERQ_STAGE_CLEAR) {
             q->t_busy_time = 0ULL;
+            q->t_busy_backlog = false;
             new_stage = THEATERQ_STAGE_LOAD;
             q->deletion_pending = true;
             start_replay = THEATERQ_REPLAY_STOP | THEATERQ_REPLAY_CLEAR;
@@ -1509,6 +1518,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->syncgrp = NULL;
     q->isdup = false;
     q->t_busy_time = 0ULL;
+    q->t_busy_backlog = false;
     q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
 
@@ -1545,6 +1555,7 @@ static void theaterq_reset(struct Qdisc *sch)
     q->stage = THEATERQ_STAGE_LOAD;
     theaterq_stats_clear(&q->stats);
     q->t_busy_time = 0ULL;
+    q->t_busy_backlog = false;
     if (q->qdisc) qdisc_reset(q->qdisc);
     qdisc_watchdog_cancel(&q->fifo_watchdog);
     qdisc_watchdog_cancel(&q->edfq_watchdog);
