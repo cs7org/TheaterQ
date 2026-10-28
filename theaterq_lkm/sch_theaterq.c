@@ -926,26 +926,16 @@ static struct theaterq_entry *theaterq_get_entry(struct theaterq_sched_data *q,
     if (q->cont_mode == THEATERQ_CONT_LOOP && 
         time_since_update >= (q->e_totaltime - q->e_progresstime)) {
 
-        u64 full_loops = time_since_update / q->e_totaltime;
-        u64 remainder = time_since_update % q->e_totaltime;
-        
-        // Shortcut all full loops over the list
-        if (full_loops >= 1) {
-            u64 loop_time = full_loops * q->e_totaltime;
-            q->stats.looped += full_loops;
-            q->stats.total_entries += full_loops * q->e_entries;
-            q->stats.total_time += loop_time;
-            q->t_updated += loop_time;
-        }
+        // Move to the start of the loop that contains 'now': first to the
+        // end of the current loop, then over all full loops after it
+        u64 time_to_start = q->e_totaltime - q->e_progresstime;
+        u64 full_loops = (time_since_update - time_to_start) / q->e_totaltime;
+        u64 loop_time = full_loops * q->e_totaltime;
 
-        // Shortcut the last loop back the the start of the list
-        if (remainder >= (q->e_totaltime - q->e_progresstime)) {
-            u64 time_to_start = q->e_totaltime - q->e_progresstime;
-            q->stats.looped++;
-            q->stats.total_entries += q->e_entries - q->e_current;
-            q->stats.total_time += time_to_start;
-            q->t_updated += time_to_start;
-        }
+        q->stats.looped += full_loops + 1;
+        q->stats.total_entries += q->e_entries - q->e_current + full_loops * q->e_entries;
+        q->stats.total_time += time_to_start + loop_time;
+        q->t_updated += time_to_start + loop_time;
 
         q->e_current = 0;
         q->e_progresstime = 0;
