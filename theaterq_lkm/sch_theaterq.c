@@ -548,7 +548,7 @@ static int theaterq_start_replay(struct theaterq_sched_data *q, u64 now)
     q->t_busy_time = 0ULL;
     q->stage = THEATERQ_STAGE_RUN;
     q->t_updated = now;
-    memset(q->r_routes_busy, (reorder_routes + 1) * sizeof(u64), 0);
+    memset(q->r_routes_busy, 0, (reorder_routes + 1) * sizeof(u64));
     WRITE_ONCE(q->current_entry, q->e_head);
 
     return 0;
@@ -1480,7 +1480,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
-    q->r_routes_busy = kmalloc((reorder_routes + 1) * sizeof(u64), 
+    q->r_routes_busy = kcalloc(reorder_routes + 1, sizeof(u64),
                                    GFP_KERNEL);
 
     if (!q->r_routes_busy) {
@@ -1488,15 +1488,13 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
         return -ENOMEM;
     }
 
-    q->r_fifo_occupancy = kmalloc((bottleneck_fifos + 1) * sizeof(u64),
+    q->r_fifo_occupancy = kcalloc(bottleneck_fifos + 1, sizeof(u64),
                                     GFP_KERNEL);
     if (!q->r_fifo_occupancy) {
         printk(KERN_ERR "sch_theaterq: Unable to allocate memory for fifo occupancy counters.\n");
         kfree(q->r_routes_busy);
         return -ENOMEM;
     }
-
-    memset(q->r_fifo_occupancy, (reorder_routes + 1) * sizeof(u64), 0);
 
     // We will manage our queue sizes ourselves
     sch->limit = __UINT32_MAX__;
@@ -1538,7 +1536,7 @@ static void theaterq_reset(struct Qdisc *sch)
     qdisc_reset_queue(sch);
     theaterq_edfq_reset(sch);
     theaterq_fifo_reset(sch);
-    memset(q->r_fifo_occupancy, (reorder_routes + 1) * sizeof(u64), 0);
+    memset(q->r_fifo_occupancy, 0, (bottleneck_fifos + 1) * sizeof(u64));
     // Leave the syncgroup but do not stop the other members
     theaterq_syncgroup_leave(q);
     theaterq_stop_replay(q, true);
