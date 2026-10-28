@@ -392,15 +392,15 @@ static inline bool dup_event(struct theaterq_sched_data *q)
            q->current_entry->dup_prob >= prandom_u32_state(&q->prng.prng_state);
 }
 
-static inline s64 get_pkt_delay(s64 mu, s32 sigma, struct prng *prng)
+static inline s64 get_pkt_delay(s64 mu, s64 sigma, struct prng *prng)
 {
-    u32 rnd;
+    s64 d;
 
     if (sigma == 0)
         return mu;
 
-    rnd = prandom_u32_state(&prng->prng_state);
-    return ((rnd % (2 * (u32) sigma)) + mu) - sigma;
+    d = (s64)(prandom_u32_state(&prng->prng_state) % (2 * (u64) sigma)) + mu - sigma;
+    return d < 0 ? 0 : d;
 }
 
 static inline bool is_rate_unlimited(const struct theaterq_sched_data *q)
