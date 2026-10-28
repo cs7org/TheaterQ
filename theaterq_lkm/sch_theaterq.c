@@ -1480,6 +1480,11 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     int ret;
     struct theaterq_sched_data *q = qdisc_priv(sch);
 
+    // theaterq_destroy() runs when init fails: set up what it touches first
+    spin_lock_init(&q->e_lock);
+    qdisc_watchdog_init(&q->fifo_watchdog, sch);
+    qdisc_watchdog_init(&q->edfq_watchdog, sch);
+
     q->r_routes_busy = kmalloc((reorder_routes + 1) * sizeof(u64), 
                                    GFP_KERNEL);
 
@@ -1492,8 +1497,7 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
                                     GFP_KERNEL);
     if (!q->r_fifo_occupancy) {
         printk(KERN_ERR "sch_theaterq: Unable to allocate memory for fifo occupancy counters.\n");
-        kfree(q->r_routes_busy);
-        return -ENOMEM;
+        return -ENOMEM; // theaterq_destroy() frees r_routes_busy
     }
 
     memset(q->r_fifo_occupancy, (reorder_routes + 1) * sizeof(u64), 0);
@@ -1511,10 +1515,6 @@ static int theaterq_init(struct Qdisc *sch, struct nlattr *opt,
     q->t_busy_time = 0ULL;
     q->t_updated = THEATERQ_NO_EXPIRY;
     q->deletion_pending = false;
-
-    spin_lock_init(&q->e_lock);
-    qdisc_watchdog_init(&q->fifo_watchdog, sch);
-    qdisc_watchdog_init(&q->edfq_watchdog, sch);
 
     if (!opt) return -EINVAL;
 
