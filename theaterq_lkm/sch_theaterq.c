@@ -767,7 +767,8 @@ static ssize_t ingest_cdev_write(struct file *filp, const char __user *buffer,
                 }
 
                 entry->keep = entry->keep * THEATERQ_NS_PER_US; // µs -> ns 
-                entry->rate = div64_u64(entry->rate, 8); // bits per second -> byte per second
+                if (entry->rate > 0) // keep -1 (unlimited) negative
+                    entry->rate = div64_u64(entry->rate, 8); // bits per second -> byte per second
                 entry->next = NULL;
 
                 // Access to the linked list only under lock, to prevent
